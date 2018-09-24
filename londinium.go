@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	// "fmt"
 	"github.com/couchbase/vellum"
+	"github.com/boltdb/bolt"
 	"io"
 	"log"
 	"os"
@@ -91,14 +92,16 @@ func loadCsv(filename string, schema Schema, frame_chan chan *Frame) {
 }
 
 
-func saveFrame(frame *Frame, filename string) {
+func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
 	for pos, header := range(frame.KeyColumns) {
 		go func(header string) {
-			idx_name := filename + "-idx-" +  strconv.Itoa(pos)
-			_, reverse := buildIndex(frame.Data[header], idx_name)
+			idx_name := label + "-idx-" +  strconv.Itoa(pos)
+			idx, reverse := buildIndex(frame.Data[header])
+			err := bkt.Put([]byte(idx_name), idx.Bytes())
+			check(err)
 			inbox <- &Indexer{header, reverse}
 		}(header)
 	}
@@ -112,9 +115,9 @@ func saveFrame(frame *Frame, filename string) {
 
 	// Join every columns in one big key
 	// TODO: some column may only need 2 bytes (aka uint16)
-	fh, err := os.Create(filename + ".fst")
+	var fst bytes.Buffer
+	builder, err := vellum.New(&fst, nil)
 	check(err)
-	builder, err := vellum.New(fh, nil)
 	key_len := len(reverse_map) * 4
 	values := frame.Data[frame.ValueColumn]
 	for row := 0; row < frame.Len(); row++ {
@@ -129,10 +132,11 @@ func saveFrame(frame *Frame, filename string) {
 		check(err)
 	}
 	builder.Close()
+	bkt.Put([]byte(label), fst.Bytes())
 }
 
 
-func buildIndex(arr []string, name string) (bytes.Buffer, []uint32){
+func buildIndex(arr []string) (bytes.Buffer, []uint32){
 	// Sort input
 	tmp := make([]string, len(arr))
 	reverse := make([]uint32, len(arr))
@@ -155,13 +159,7 @@ func buildIndex(arr []string, name string) (bytes.Buffer, []uint32){
 	}
 	builder.Close()
 
-
 	// Save fst
-	fh, err := os.Create(name + ".fst")
-	check(err)
-	defer fh.Close()
-	// _, err = idx.WriteTo(fh)
-	_, err = fh.Write(idx.Bytes())
 	check(err)
 
 	// Use index to compute reverse array
@@ -199,14 +197,30 @@ func main() {
 	println("Load " + input_file)
 	name := Basename(input_file)
 
+	// Load csv and fill chan with chunks
 	frame_chan := make(chan *Frame)
 	var fr *Frame
 	go 	loadCsv(os.Args[1], schema, frame_chan)
 	pos := 0
-	for fr = range(frame_chan) {
-		saveFrame(fr, name + "-" + strconv.Itoa(pos))
-		pos++
-	}
+
+	// Create db
+	db, err := bolt.Open("test.db", 0600, nil)
+	check(err)
+	// Transaction closure
+	err = db.Update(func(tx *bolt.Tx) error {
+		// Create a bucket.
+		bkt, err := tx.CreateBucketIfNotExists([]byte("default"))
+		check(err)
+		for fr = range(frame_chan) {
+			saveFrame(bkt, fr, name + "-" + strconv.Itoa(pos))
+			pos++
+		}
+		return nil
+	})
+	check(err)
+	err = db.Close()
+	check(err)
+
 	elapsed := time.Since(start)
 	log.Printf("Done (%s)", elapsed)
 }
