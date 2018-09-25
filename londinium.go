@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/csv"
-	// "fmt"
+	"fmt"
 	"github.com/couchbase/vellum"
 	"github.com/boltdb/bolt"
 	"io"
@@ -27,6 +27,7 @@ type Frame struct {
 }
 type Indexer struct {
 	Name string
+	Index bytes.Buffer
 	Values []uint32
 }
 
@@ -49,11 +50,13 @@ func (self *Frame) KeyWidth() int {
 	return len(self.KeyColumns)
 }
 
+
 func check(err error) {
 	if err != nil {
 		panic(err)
 	}
 }
+
 
 func loadCsv(filename string, schema Schema, frame_chan chan *Frame) {
 	// Read a csv and feed the frame_chan with frames of size
@@ -96,20 +99,21 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
-	for pos, header := range(frame.KeyColumns) {
+	for _, header := range(frame.KeyColumns) {
 		go func(header string) {
-			idx_name := label + "-idx-" +  strconv.Itoa(pos)
 			idx, reverse := buildIndex(frame.Data[header])
-			err := bkt.Put([]byte(idx_name), idx.Bytes())
-			check(err)
-			inbox <- &Indexer{header, reverse}
+			inbox <- &Indexer{header, idx, reverse}
 		}(header)
 	}
 
-	// Wait for every index to be saved
+	// Wait for every index to be created and save them
 	reverse_map := make(map[string][]uint32)
 	for i:=0; i < frame.KeyWidth(); i++ {
 		rev := <- inbox
+		label := rev.Name + "-idx-" +  strconv.Itoa(i)
+		err := bkt.Put([]byte(label), rev.Index.Bytes())
+		check(err)
+
 		reverse_map[rev.Name] = rev.Values
 	}
 
@@ -126,9 +130,9 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
 			buff := key[pos * 4:(pos+1) * 4]
 			binary.BigEndian.PutUint32(buff, reverse_map[colname][row])
 		}
-		weight, err := strconv.Atoi(values[row])
+		weight, err := strconv.ParseFloat(values[row], 64)
 		check(err)
-		err = builder.Insert(key, uint64(weight))
+		err = builder.Insert(key, uint64(weight * 1000))
 		check(err)
 	}
 	builder.Close()
@@ -187,8 +191,7 @@ func Basename(s string) string {
 }
 
 
-func main() {
-	start := time.Now()
+func write() {
 	if len(os.Args) < 4 {
 		log.Fatal("Not enough arguments")
 	}
@@ -220,7 +223,37 @@ func main() {
 	check(err)
 	err = db.Close()
 	check(err)
+}
 
+
+func read() {
+	// if len(os.Args) < 4 {
+	// 	log.Fatal("Not enough arguments")
+	// }
+
+	// Load csv and fill chan with chunks
+	// Connect db
+	db, err := bolt.Open("test.db", 0600, nil)
+	check(err)
+	// Transaction closure
+	err = db.Update(func(tx *bolt.Tx) error {
+		// Create a bucket.
+		bkt := tx.Bucket([]byte("default"))
+		err = bkt.ForEach(func(k, v []byte) error {
+			fmt.Printf("A %s is %s.\n", k, len(v))
+			return nil
+		})
+		check(err)
+		return nil
+	})
+	check(err)
+
+}
+
+func main() {
+	start := time.Now()
+	// write()
+	read()
 	elapsed := time.Since(start)
 	log.Printf("Done (%s)", elapsed)
 }
