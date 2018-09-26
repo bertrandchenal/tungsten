@@ -58,6 +58,29 @@ func check(err error) {
 }
 
 
+
+// Netstring encoding
+func Encode(items ...string) string {
+	var buffer bytes.Buffer
+	for _, item := range items {
+		buffer.WriteString(fmt.Sprintf("%d:%s,", len(item), item))
+	}
+	return buffer.String()
+}
+
+func Decode(input string) ([]string, error) {
+
+	var res []string
+	var buf = bytes.NewBuffer(input)
+	lengthToken, err := buf.ReadBytes(":")
+	if err == io.EOF {
+		break
+	} else {
+		return nil, err
+	}
+	// TODO
+}
+
 func loadCsv(filename string, schema Schema, frame_chan chan *Frame) {
 	// Read a csv and feed the frame_chan with frames of size
 	// CHUNK_SIZE or less
