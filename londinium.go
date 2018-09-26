@@ -136,7 +136,8 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
 		check(err)
 	}
 	builder.Close()
-	bkt.Put([]byte(label), fst.Bytes())
+	err = bkt.Put([]byte(label), fst.Bytes())
+	check(err)
 }
 
 
