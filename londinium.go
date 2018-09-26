@@ -1,4 +1,4 @@
-package main
+package londinium
 
 import (
 	"bytes"
@@ -60,25 +60,42 @@ func check(err error) {
 
 
 // Netstring encoding
-func Encode(items ...string) string {
+func Encode(items ...[]byte) []byte {
 	var buffer bytes.Buffer
 	for _, item := range items {
-		buffer.WriteString(fmt.Sprintf("%d:%s,", len(item), item))
+		data := []byte(fmt.Sprintf("%d:%s,", len(item), item))
+		_, err := buffer.Write(data)
+		check(err)
 	}
-	return buffer.String()
+	return buffer.Bytes()
 }
 
-func Decode(input string) ([]string, error) {
-
-	var res []string
-	var buf = bytes.NewBuffer(input)
-	lengthToken, err := buf.ReadBytes(":")
+// Netstring decoding
+func Decode(buf *bytes.Buffer) ([][]byte, error) {
+	head, err := buf.ReadBytes(byte(':'))
 	if err == io.EOF {
-		break
-	} else {
-		return nil, err
+		return make([][]byte, 0), nil
 	}
-	// TODO
+	// Read header giving item size
+	length, err := strconv.ParseInt(string(head[:len(head) - 1]), 10, 32)
+	check(err)
+	// Read payload
+	payload := make([]byte, length)
+	_, err = io.ReadFull(buf, payload)
+	check(err)
+	res := [][]byte{payload}
+
+	// Read end delimiter
+	delim, err := buf.ReadByte()
+	check(err)
+	if delim != byte(',') {
+		panic("Unexpected end of stream")
+	}
+
+	tail, err := Decode(buf)
+	check(err)
+
+	return append(res, tail...), nil
 }
 
 func loadCsv(filename string, schema Schema, frame_chan chan *Frame) {
@@ -275,7 +292,7 @@ func read() {
 		// Create a bucket.
 		bkt := tx.Bucket([]byte("default"))
 		err = bkt.ForEach(func(k, v []byte) error {
-			fmt.Printf("A %s is %s.\n", k, len(v))
+			fmt.Printf("A %s is %v.\n", k, len(v))
 			return nil
 		})
 		check(err)
