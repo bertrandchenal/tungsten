@@ -193,6 +193,17 @@ func Basename(s string) string {
 
 
 func write() {
+
+    // TODO db organisation:
+    //
+    // Bucket  | content
+    // --------+--------
+    // :schema:| label -> list of cols (last one being the values)
+    // --------+--------
+    // Label_i | rev -> list of fst blobs
+    //
+    // List are netstring encoded, label cannot start with a :
+
 	if len(os.Args) < 4 {
 		log.Fatal("Not enough arguments")
 	}
