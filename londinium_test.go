@@ -6,10 +6,10 @@ import (
 )
 
 func TestIt(t *testing.T) {
-	var encoded = [][]byte{
-		[]byte("Hello world!"),
-		[]byte(""),
-		[]byte("Goodbye world"),
+	var encoded = []string{
+		"Hello world!",
+		"",
+		"Goodbye world",
 	}
 	out := Encode(encoded[0], encoded[1], encoded[2])
 	if "12:Hello world!,0:,13:Goodbye world," != string(out) {
