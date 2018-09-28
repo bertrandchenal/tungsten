@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"github.com/boltdb/bolt"
 	"github.com/couchbase/vellum"
@@ -226,7 +227,7 @@ func Basename(s string) string {
 	return s
 }
 
-func create_label(name string, columns []string) {
+func create_label(name string, columns []string) (error) {
 	// DB organisation:
 	//
 	// Bucket  | content
@@ -236,6 +237,10 @@ func create_label(name string, columns []string) {
 	// Label_i | rev -> list of fst blobs
 	//
 	// List are netstring encoded, label cannot start with a :
+
+	if len(columns) < 2 {
+		return errors.New("Number of columns in schema should be at least 2")
+	}
 
 	db, err := bolt.Open("test.db", 0600, nil)
 	check(err)
@@ -255,6 +260,7 @@ func create_label(name string, columns []string) {
 		return err
 	})
 	check(err)
+	return nil
 }
 
 func write() {
@@ -350,7 +356,8 @@ func main() {
 		columns, err := csvReader.Read()
 		fmt.Println(columns)
 		check(err)
-		create_label(*new_label, columns)
+		err = create_label(*new_label, columns)
+		check(err)
 	}
 
 	elapsed := time.Since(start)
