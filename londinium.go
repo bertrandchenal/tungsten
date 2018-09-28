@@ -1,7 +1,6 @@
-package main
+package londinium
 
 import (
-	"flag"
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
@@ -15,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const CHUNK_SIZE = 1000000 // Must be < 2^32
@@ -26,18 +24,20 @@ type Frame struct {
 	KeyColumns  []string
 	ValueColumn string
 	Data        map[string][]string
+	err error
 }
 type Indexer struct {
-	Name   string
 	Index  bytes.Buffer
 	Values []uint32
+	Name   string
+	err error
 }
 
 func NewFrame(schema Schema) *Frame {
 	data := make(map[string][]string)
 	key_columns := schema[:len(schema)-1]
 	value_column := schema[len(schema)-1]
-	return &Frame{schema, key_columns, value_column, data}
+	return &Frame{schema, key_columns, value_column, data, nil}
 }
 
 func (self *Frame) Len() int {
@@ -52,21 +52,19 @@ func (self *Frame) KeyWidth() int {
 	return len(self.KeyColumns)
 }
 
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
 
 // Netstring encoding
-func Encode(items ...string) []byte {
+func Encode(items ...string) ([]byte, error) {
 	var buffer bytes.Buffer
 	for _, item := range items {
 		data := []byte(fmt.Sprintf("%d:%s,", len(item), item))
 		_, err := buffer.Write(data)
-		check(err)
+		if err != nil {
+			return nil, err
+		}
+
 	}
-	return buffer.Bytes()
+	return buffer.Bytes(), nil
 }
 
 // Netstring decoding
@@ -77,35 +75,45 @@ func Decode(buf *bytes.Buffer) ([]string, error) {
 	}
 	// Read header giving item size
 	length, err := strconv.ParseInt(string(head[:len(head)-1]), 10, 32)
-	check(err)
+	if err != nil {
+		return nil, err
+	}
+
 	// Read payload
 	payload := make([]byte, length)
 	_, err = io.ReadFull(buf, payload)
-	check(err)
+	if err != nil {
+		return nil, err
+	}
+
 	res := []string{string(payload)}
 
 	// Read end delimiter
 	delim, err := buf.ReadByte()
-	check(err)
+	if err != nil {
+		return nil, err
+	}
 	if delim != byte(',') {
 		panic("Unexpected end of stream")
 	}
 
 	tail, err := Decode(buf)
-	check(err)
+	if err != nil {
+		return nil, err
+	}
 
 	return append(res, tail...), nil
 }
 
-func loadCsv(filename string, schema Schema, frame_chan chan *Frame) {
+func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 	// Read a csv and feed the frame_chan with frames of size
 	// CHUNK_SIZE or less
-	fh, err := os.Open(filename)
-	check(err)
-	defer fh.Close()
 	r := csv.NewReader(fh)
 	headers, err := r.Read()
-	check(err)
+	if err != nil {
+		frame_chan <- &Frame{err: err}
+		return
+	}
 
 	for {
 		frame := NewFrame(schema)
@@ -123,35 +131,43 @@ func loadCsv(filename string, schema Schema, frame_chan chan *Frame) {
 				close(frame_chan)
 				return
 			}
-			check(err)
+			if err != nil {
+				frame_chan <- &Frame{err: err}
+				return
+			}
 
 			for pos, header := range headers {
 				frame.Data[header] = append(frame.Data[header], record[pos])
 			}
 		}
-
 	}
+
 }
 
-func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
+func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) error {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
 	for _, header := range frame.KeyColumns {
 		go func(header string) {
-			idx, reverse := buildIndex(frame.Data[header])
-			inbox <- &Indexer{header, idx, reverse}
+			indexer := buildIndex(frame.Data[header])
+			indexer.Name = header
+			inbox <- indexer
 		}(header)
 	}
 
 	// Wait for every index to be created and save them
 	reverse_map := make(map[string][]uint32)
 	for i := 0; i < frame.KeyWidth(); i++ {
-		rev := <-inbox
+		rev := <- inbox
+		if rev.err != nil {
+			return rev.err
+		}
 		label := rev.Name + "-idx-" + strconv.Itoa(i)
 		err := bkt.Put([]byte(label), rev.Index.Bytes())
-		check(err)
-
+		if err != nil {
+			return err
+		}
 		reverse_map[rev.Name] = rev.Values
 	}
 
@@ -159,7 +175,10 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
 	// TODO: some column may only need 2 bytes (aka uint16)
 	var fst bytes.Buffer
 	builder, err := vellum.New(&fst, nil)
-	check(err)
+	if err != nil {
+		return err
+	}
+
 	key_len := len(reverse_map) * 4
 	values := frame.Data[frame.ValueColumn]
 	for row := 0; row < frame.Len(); row++ {
@@ -169,16 +188,22 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) {
 			binary.BigEndian.PutUint32(buff, reverse_map[colname][row])
 		}
 		weight, err := strconv.ParseFloat(values[row], 64)
-		check(err)
+		if err != nil {
+			return err
+		}
+
 		err = builder.Insert(key, uint64(weight*1000))
-		check(err)
+		if err != nil {
+			return err
+		}
+
 	}
 	builder.Close()
 	err = bkt.Put([]byte(label), fst.Bytes())
-	check(err)
+	return err
 }
 
-func buildIndex(arr []string) (bytes.Buffer, []uint32) {
+func buildIndex(arr []string) (*Indexer) {
 	// Sort input
 	tmp := make([]string, len(arr))
 	reverse := make([]uint32, len(arr))
@@ -188,7 +213,10 @@ func buildIndex(arr []string) (bytes.Buffer, []uint32) {
 	// Build index in-memory
 	var idx bytes.Buffer
 	builder, err := vellum.New(&idx, nil)
-	check(err)
+		if err != nil {
+		return &Indexer{err: err}
+	}
+
 	var prev string
 	pos := uint64(0)
 	for _, item := range tmp {
@@ -202,21 +230,30 @@ func buildIndex(arr []string) (bytes.Buffer, []uint32) {
 	builder.Close()
 
 	// Save fst
-	check(err)
+	if err != nil {
+		return &Indexer{err: err}
+	}
+
 
 	// Use index to compute reverse array
 	fst, err := vellum.Load(idx.Bytes())
-	check(err)
+		if err != nil {
+		return &Indexer{err: err}
+	}
+
 	for pos, item := range arr {
 		id, exists, err := fst.Get([]byte(item))
-		check(err)
+		if err != nil {
+			return &Indexer{err: err}
+		}
+
 		if !exists {
 			panic("Fatal!")
 		}
 		// TODO assert array len is less than 2^32
 		reverse[pos] = uint32(id)
 	}
-	return idx, reverse
+	return &Indexer{idx, reverse, "", nil}
 }
 
 func Basename(s string) string {
@@ -227,7 +264,7 @@ func Basename(s string) string {
 	return s
 }
 
-func create_label(name string, columns []string) (error) {
+func CreateLabel(name string, columns []string) error {
 	// DB organisation:
 	//
 	// Bucket  | content
@@ -237,41 +274,42 @@ func create_label(name string, columns []string) (error) {
 	// Label_i | rev -> list of fst blobs
 	//
 	// List are netstring encoded, label cannot start with a :
-
 	if len(columns) < 2 {
 		return errors.New("Number of columns in schema should be at least 2")
 	}
 
 	db, err := bolt.Open("test.db", 0600, nil)
-	check(err)
+	if err != nil {
+		return err
+	}
+
 	// Transaction closure
 	err = db.Update(func(tx *bolt.Tx) error {
 		// Create a bucket.
+		// TODO use nested buckets!
 		schema_bkt, err := tx.CreateBucketIfNotExists([]byte(":schema:"))
-		check(err)
+		if err != nil {
+			return err
+		}
+
 		if name[0] == ':' {
 			msg := "Character ':' not allowed at beginning of label (%v)"
 			return fmt.Errorf(msg, name)
 		}
 
-		schema_bkt.Put([]byte(name), Encode(columns...))
+		value, err := Encode(columns...)
+		if err != nil {
+			return err
+		}
+		schema_bkt.Put([]byte(name), value)
 
 		_, err = tx.CreateBucket([]byte(name))
 		return err
 	})
-	check(err)
-	return nil
+	return err
 }
 
-func write() {
-
-	if len(os.Args) < 3 {
-		log.Fatal("Not enough arguments")
-	}
-	input_file := os.Args[1]
-	label := os.Args[2]
-	println("Load " + input_file)
-
+func Write(label string, csv_stream io.Reader) error {
 	var schema *Schema
 	db, err := bolt.Open("test.db", 0600, nil)
 	err = db.View(func(tx *bolt.Tx) error {
@@ -281,17 +319,18 @@ func write() {
 			return fmt.Errorf("Unknown label (%v)", label)
 		}
 		foo, err := Decode(bytes.NewBuffer(value))
-		println(string(foo[0]))
 		bar := Schema(foo)
 		schema = &bar
-		check(err)
-		return nil
+		return err
 	})
-	check(err)
+	if err != nil {
+		return err
+	}
+
 	// Load csv and fill chan with chunks
 	frame_chan := make(chan *Frame)
 	var fr *Frame
-	go loadCsv(os.Args[1], *schema, frame_chan)
+	go loadCsv(csv_stream, *schema, frame_chan)
 	pos := 0
 
 	// Transaction closure
@@ -299,17 +338,23 @@ func write() {
 		// Create a bucket.
 		bkt := tx.Bucket([]byte(label))
 		for fr = range frame_chan {
+			if fr.err != nil {
+				return fr.err
+			}
 			saveFrame(bkt, fr, label+"-"+strconv.Itoa(pos))
 			pos++
 		}
 		return nil
 	})
-	check(err)
+	if err != nil {
+		return err
+	}
+
 	err = db.Close()
-	check(err)
+	return err
 }
 
-func read() {
+func Read() error {
 	// Load csv and fill chan with chunks
 	// Connect db
 	if len(os.Args) < 2 {
@@ -317,7 +362,10 @@ func read() {
 	}
 	label := os.Args[1]
 	db, err := bolt.Open("test.db", 0600, nil)
-	check(err)
+	if err != nil {
+		return err
+	}
+
 	// Transaction closure
 	err = db.Update(func(tx *bolt.Tx) error {
 		// Create a bucket.
@@ -326,40 +374,11 @@ func read() {
 			fmt.Printf("A %s is %v.\n", k, len(v))
 			return nil
 		})
-		check(err)
+		if err != nil {
+			return err
+		}
+
 		return nil
 	})
-	check(err)
-}
-
-func main() {
-	start := time.Now()
-	db := flag.String("db", "ldm.db", "Database file")
-	file := flag.String("f", "", "Input/Output file")
-	read_label := flag.String("r", "", "Read label")
-	write_label := flag.String("w", "", "Write label")
-	new_label := flag.String("c", "", "New label")
-	schema := flag.String("s", "", "Schema")
-	flag.Parse()
-
-    fmt.Println(*file, *db, "" == *read_label, *write_label, *new_label)
-
-	// write()
-	// read()
-
-	// Create label
-	if *new_label != "" {
-		if *schema == "" {
-			log.Fatal("Missing -s argument")
-		}
-		csvReader := csv.NewReader(bytes.NewBuffer([]byte(*schema)))
-		columns, err := csvReader.Read()
-		fmt.Println(columns)
-		check(err)
-		err = create_label(*new_label, columns)
-		check(err)
-	}
-
-	elapsed := time.Since(start)
-	log.Printf("Done (%s)", elapsed)
+	return err
 }
