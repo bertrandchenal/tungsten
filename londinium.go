@@ -55,14 +55,17 @@ func (self *Frame) KeyWidth() int {
 
 // Netstring encoding
 func Encode(items ...string) ([]byte, error) {
+	// TODO create a Encoder type that holds the buffer and accept multi calls to Write (or WriteString)
 	var buffer bytes.Buffer
 	for _, item := range items {
-		data := []byte(fmt.Sprintf("%d:%s,", len(item), item))
-		_, err := buffer.Write(data)
+		head := []byte(fmt.Sprintf("%d:", len(item)))
+		tail := []byte(",")
+		_, err := buffer.Write(head)
+		_, err := buffer.Write(item)
+		_, err := buffer.Write(tail)
 		if err != nil {
 			return nil, err
 		}
-
 	}
 	return buffer.Bytes(), nil
 }
@@ -144,7 +147,7 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 
 }
 
-func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) error {
+func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
@@ -163,15 +166,13 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) error {
 		if rev.err != nil {
 			return rev.err
 		}
-		label := rev.Name + "-idx-" + strconv.Itoa(i)
-		err := bkt.Put([]byte(label), rev.Index.Bytes())
+		// err := bkt.Put(key, rev.Index.Bytes()) TODO ADD TO ENCODER
 		if err != nil {
 			return err
 		}
 		reverse_map[rev.Name] = rev.Values
 	}
 
-	// Join every columns in one big key
 	// TODO: some column may only need 2 bytes (aka uint16)
 	var fst bytes.Buffer
 	builder, err := vellum.New(&fst, nil)
@@ -199,7 +200,11 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame, label string) error {
 
 	}
 	builder.Close()
-	err = bkt.Put([]byte(label), fst.Bytes())
+
+
+	key = bkt.NextSequence()
+	payload, err := Encode(rev.Index.Bytes(), fst.Bytes()) // TODO USE ENCODER
+	err = bkt.Put(key, payload)
 	return err
 }
 
@@ -264,16 +269,28 @@ func Basename(s string) string {
 	return s
 }
 
+
 func CreateLabel(name string, columns []string) error {
-	// DB organisation:
-	//
-	// Bucket  | content
-	// --------+--------
-	// :schema:| label -> list of cols (last one being the values)
-	// --------+--------
-	// Label_i | rev -> list of fst blobs
-	//
-	// List are netstring encoded, label cannot start with a :
+    // DB organisation:
+    //
+    // - label_1
+    //   - schema: netstring list of cols
+    //   - frames:
+    //     - 0x1: frame-blob (netsting of chunks)
+    //     - ...
+    //     - 0x3f6: fst
+    //   - frame-starts:
+    //     - key_1: 0x1
+    //     - ...
+    //     - key_n: 0x3f6: fst
+    //   - frame-ends:
+    //     - key_1: 0x1
+    //     - ...
+    //     - key_n: 0x3f6: fst
+    // - ...
+    // - label_n
+    //
+    // Each chunk is a netstring of indexes fst, and data fst.
 	if len(columns) < 2 {
 		return errors.New("Number of columns in schema should be at least 2")
 	}
@@ -285,42 +302,42 @@ func CreateLabel(name string, columns []string) error {
 
 	// Transaction closure
 	err = db.Update(func(tx *bolt.Tx) error {
-		// Create a bucket.
-		// TODO use nested buckets!
-		schema_bkt, err := tx.CreateBucketIfNotExists([]byte(":schema:"))
+		bkt, err := tx.CreateBucket([]byte(name))
 		if err != nil {
 			return err
 		}
-
-		if name[0] == ':' {
-			msg := "Character ':' not allowed at beginning of label (%v)"
-			return fmt.Errorf(msg, name)
-		}
-
-		value, err := Encode(columns...)
+		schema, err := Encode(columns...)
 		if err != nil {
 			return err
 		}
-		schema_bkt.Put([]byte(name), value)
-
-		_, err = tx.CreateBucket([]byte(name))
+		if err = bkt.Put([]byte("schema"), schema); err != nil {
+			// Save schema
+			return err
+		} else if _, err = tx.CreateBucket([]byte("frames")); err != nil {
+			// Create frame bucket
+			return err
+		} else if _, err = tx.CreateBucket([]byte("frames-starts")); err != nil {
+			// Create starts & ends bucket
+			return err
+		}
+		_, err = tx.CreateBucket([]byte("frames-ends"))
 		return err
 	})
 	return err
 }
 
+
 func Write(label string, csv_stream io.Reader) error {
 	var schema *Schema
 	db, err := bolt.Open("test.db", 0600, nil)
 	err = db.View(func(tx *bolt.Tx) error {
-		schema_bkt := tx.Bucket([]byte(":schema:"))
-		value := schema_bkt.Get([]byte(label))
-		if value == nil {
-			return fmt.Errorf("Unknown label (%v)", label)
+		bkt, err := tx.Bucket([]byte(label))
+		if err != nil {
+			return err
 		}
-		foo, err := Decode(bytes.NewBuffer(value))
-		bar := Schema(foo)
-		schema = &bar
+		value := bkt.Get([]byte("schema"))
+		columns, err := Decode(bytes.NewBuffer(value))
+		schema = &Schema(columns)
 		return err
 	})
 	if err != nil {
@@ -335,13 +352,15 @@ func Write(label string, csv_stream io.Reader) error {
 
 	// Transaction closure
 	err = db.Update(func(tx *bolt.Tx) error {
+		bkt, err := tx.Bucket([]byte(label))
+		frame_bkt, err := bkt.Bucket([]byte("frames"))
+
 		// Create a bucket.
-		bkt := tx.Bucket([]byte(label))
 		for fr = range frame_chan {
 			if fr.err != nil {
 				return fr.err
 			}
-			saveFrame(bkt, fr, label+"-"+strconv.Itoa(pos))
+			saveFrame(frame_bkt, fr)
 			pos++
 		}
 		return nil
