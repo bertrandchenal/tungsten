@@ -33,6 +33,11 @@ type Indexer struct {
 	err error
 }
 
+type NetString struct {
+	buffer bytes.Buffer
+    err error
+}
+
 func NewFrame(schema Schema) *Frame {
 	data := make(map[string][]string)
 	key_columns := schema[:len(schema)-1]
@@ -53,59 +58,66 @@ func (self *Frame) KeyWidth() int {
 }
 
 
-// Netstring encoding
-func Encode(items ...string) ([]byte, error) {
-	// TODO create a Encoder type that holds the buffer and accept multi calls to Write (or WriteString)
+// Netstring decode & encode
+func NewNetString(values ...[]byte) *NetString{
 	var buffer bytes.Buffer
+	for _, val := range values {
+		buffer.Write(val)
+	}
+	return &NetString{buffer, nil}
+}
+
+func (self *NetString) Encode(items ...[]byte) {
 	for _, item := range items {
 		head := []byte(fmt.Sprintf("%d:", len(item)))
 		tail := []byte(",")
-		_, err := buffer.Write(head)
-		_, err := buffer.Write(item)
-		_, err := buffer.Write(tail)
-		if err != nil {
-			return nil, err
+		_, err := self.buffer.Write(head)
+		_, err = self.buffer.Write(item)
+		_, err = self.buffer.Write(tail)
+		if err != nil && self.err != nil {
+			self.err = err
+			return
 		}
 	}
-	return buffer.Bytes(), nil
 }
 
 // Netstring decoding
-func Decode(buf *bytes.Buffer) ([]string, error) {
-	head, err := buf.ReadBytes(byte(':'))
+func (self *NetString) Decode() []string {
+	head, err := self.buffer.ReadBytes(byte(':'))
 	if err == io.EOF {
-		return make([]string, 0), nil
+		return make([]string, 0)
 	}
 	// Read header giving item size
 	length, err := strconv.ParseInt(string(head[:len(head)-1]), 10, 32)
 	if err != nil {
-		return nil, err
+		self.err = err
+		return nil
 	}
-
 	// Read payload
 	payload := make([]byte, length)
-	_, err = io.ReadFull(buf, payload)
+	_, err = self.buffer.Read(payload)
 	if err != nil {
-		return nil, err
+		self.err = err
+		return nil
 	}
-
 	res := []string{string(payload)}
-
 	// Read end delimiter
-	delim, err := buf.ReadByte()
+	delim, err := self.buffer.ReadByte()
 	if err != nil {
-		return nil, err
+		self.err = err
+		return nil
 	}
 	if delim != byte(',') {
-		panic("Unexpected end of stream")
+		self.err = errors.New("Unable de decode netstring, unexpected end of stream")
+		return nil
+	}
+	// Recurse
+	tail := self.Decode()
+	if self.err != nil {
+		return nil
 	}
 
-	tail, err := Decode(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	return append(res, tail...), nil
+	return append(res, tail...)
 }
 
 func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
@@ -159,6 +171,7 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 		}(header)
 	}
 
+	ns := NewNetString()
 	// Wait for every index to be created and save them
 	reverse_map := make(map[string][]uint32)
 	for i := 0; i < frame.KeyWidth(); i++ {
@@ -166,9 +179,9 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 		if rev.err != nil {
 			return rev.err
 		}
-		// err := bkt.Put(key, rev.Index.Bytes()) TODO ADD TO ENCODER
-		if err != nil {
-			return err
+		ns.Encode(rev.Index.Bytes())
+		if ns.err != nil {
+			return ns.err
 		}
 		reverse_map[rev.Name] = rev.Values
 	}
@@ -179,7 +192,6 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 	if err != nil {
 		return err
 	}
-
 	key_len := len(reverse_map) * 4
 	values := frame.Data[frame.ValueColumn]
 	for row := 0; row < frame.Len(); row++ {
@@ -192,20 +204,31 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 		if err != nil {
 			return err
 		}
-
 		err = builder.Insert(key, uint64(weight*1000))
 		if err != nil {
 			return err
 		}
-
 	}
 	builder.Close()
 
-
-	key = bkt.NextSequence()
-	payload, err := Encode(rev.Index.Bytes(), fst.Bytes()) // TODO USE ENCODER
-	err = bkt.Put(key, payload)
+	// Add main fst to netstring & save in db
+	ns.Encode(fst.Bytes())
+	payload := ns.buffer.Bytes()
+	if ns.err != nil {
+		return ns.err
+	}
+	key,err := bkt.NextSequence()
+	if err != nil {
+		return err
+	}
+	err = bkt.Put(itob(key), payload)
 	return err
+}
+
+func itob(v uint64) []byte {
+    b := make([]byte, 8)
+    binary.BigEndian.PutUint64(b, v)
+    return b
 }
 
 func buildIndex(arr []string) (*Indexer) {
@@ -270,7 +293,7 @@ func Basename(s string) string {
 }
 
 
-func CreateLabel(name string, columns []string) error {
+func CreateLabel(name string, columns [][]byte) error {
     // DB organisation:
     //
     // - label_1
@@ -306,9 +329,11 @@ func CreateLabel(name string, columns []string) error {
 		if err != nil {
 			return err
 		}
-		schema, err := Encode(columns...)
-		if err != nil {
-			return err
+		ns := NewNetString()
+		ns.Encode(columns...)
+		schema := ns.buffer.Bytes()
+		if ns.err != nil {
+			return ns.err
 		}
 		if err = bkt.Put([]byte("schema"), schema); err != nil {
 			// Save schema
@@ -331,14 +356,16 @@ func Write(label string, csv_stream io.Reader) error {
 	var schema *Schema
 	db, err := bolt.Open("test.db", 0600, nil)
 	err = db.View(func(tx *bolt.Tx) error {
-		bkt, err := tx.Bucket([]byte(label))
+		bkt := tx.Bucket([]byte(label))
 		if err != nil {
 			return err
 		}
 		value := bkt.Get([]byte("schema"))
-		columns, err := Decode(bytes.NewBuffer(value))
-		schema = &Schema(columns)
-		return err
+		ns := NewNetString(value)
+		columns := ns.Decode()
+		schema_ := Schema(columns)
+		schema = &schema_
+		return ns.err
 	})
 	if err != nil {
 		return err
@@ -352,8 +379,8 @@ func Write(label string, csv_stream io.Reader) error {
 
 	// Transaction closure
 	err = db.Update(func(tx *bolt.Tx) error {
-		bkt, err := tx.Bucket([]byte(label))
-		frame_bkt, err := bkt.Bucket([]byte("frames"))
+		bkt := tx.Bucket([]byte(label))
+		frame_bkt := bkt.Bucket([]byte("frames"))
 
 		// Create a bucket.
 		for fr = range frame_chan {
