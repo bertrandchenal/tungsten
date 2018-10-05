@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"github.com/boltdb/bolt"
 	"github.com/bclicn/color"
 	"os"
 	"log"
@@ -21,7 +22,7 @@ func unravel(err error) {
 
 func main() {
 	start := time.Now()
-	db := flag.String("db", "ldm.db", "Database file")
+	db_name := flag.String("db", "ldm.db", "Database file")
 	file := flag.String("f", "", "Input/Output file")
 	read_label := flag.String("r", "", "Read label")
 	write_label := flag.String("w", "", "Write label")
@@ -29,7 +30,15 @@ func main() {
 	schema := flag.String("s", "", "Schema")
 	flag.Parse()
 
-	fmt.Println(*file, *db, "" == *read_label, *write_label, *create_label)
+	fmt.Println(*file, *db_name, "" == *read_label, *write_label, *create_label)
+
+	if *db_name == "" {
+		*db_name = "ldm.db"
+	}
+	db, err := bolt.Open(*db_name, 0600, nil)
+	if err != nil {
+		unravel(err)
+	}
 
 	// Create label
 	 if *read_label != "" {
@@ -41,18 +50,20 @@ func main() {
 		csvReader := csv.NewReader(bytes.NewBuffer([]byte(*schema)))
 		columns, err := csvReader.Read()
 		if err == nil {
-			err = londinium.CreateLabel(*create_label, columns)
+			err = londinium.CreateLabel(db, *create_label, columns)
 		}
 		unravel(err)
 	} else if *write_label != "" {
 		if *file == "" {
 			fh := os.Stdin
-			londinium.Write(*write_label, fh)
+			err := londinium.Write(db, *write_label, fh)
+			unravel(err)
 		} else {
 			fh, err := os.Open(*file)
 			unravel(err)
 			defer fh.Close()
-			londinium.Write(*write_label, fh)
+			err = londinium.Write(db, *write_label, fh)
+			unravel(err)
 		}
 	}
 

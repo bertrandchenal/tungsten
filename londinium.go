@@ -59,21 +59,21 @@ func (self *Frame) KeyWidth() int {
 
 
 // Netstring decode & encode
-func NewNetString(values ...[]byte) *NetString{
+func NewNetString(values ...string) *NetString{
 	var buffer bytes.Buffer
 	for _, val := range values {
-		buffer.Write(val)
+		buffer.WriteString(val)
 	}
 	return &NetString{buffer, nil}
 }
 
-func (self *NetString) Encode(items ...[]byte) {
+func (self *NetString) Encode(items ...string) {
+	tail := ","
 	for _, item := range items {
-		head := []byte(fmt.Sprintf("%d:", len(item)))
-		tail := []byte(",")
-		_, err := self.buffer.Write(head)
-		_, err = self.buffer.Write(item)
-		_, err = self.buffer.Write(tail)
+		head := fmt.Sprintf("%d:", len(item))
+		_, err := self.buffer.WriteString(head)
+		_, err = self.buffer.WriteString(item)
+		_, err = self.buffer.WriteString(tail)
 		if err != nil && self.err != nil {
 			self.err = err
 			return
@@ -179,7 +179,7 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 		if rev.err != nil {
 			return rev.err
 		}
-		ns.Encode(rev.Index.Bytes())
+		ns.Encode(rev.Index.String())
 		if ns.err != nil {
 			return ns.err
 		}
@@ -212,7 +212,7 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 	builder.Close()
 
 	// Add main fst to netstring & save in db
-	ns.Encode(fst.Bytes())
+	ns.Encode(fst.String())
 	payload := ns.buffer.Bytes()
 	if ns.err != nil {
 		return ns.err
@@ -293,7 +293,7 @@ func Basename(s string) string {
 }
 
 
-func CreateLabel(name string, columns [][]byte) error {
+func CreateLabel(db *bolt.DB, name string, columns []string) error {
     // DB organisation:
     //
     // - label_1
@@ -318,13 +318,7 @@ func CreateLabel(name string, columns [][]byte) error {
 		return errors.New("Number of columns in schema should be at least 2")
 	}
 
-	db, err := bolt.Open("test.db", 0600, nil)
-	if err != nil {
-		return err
-	}
-
-	// Transaction closure
-	err = db.Update(func(tx *bolt.Tx) error {
+	err := db.Update(func(tx *bolt.Tx) error {
 		bkt, err := tx.CreateBucket([]byte(name))
 		if err != nil {
 			return err
@@ -338,35 +332,35 @@ func CreateLabel(name string, columns [][]byte) error {
 		if err = bkt.Put([]byte("schema"), schema); err != nil {
 			// Save schema
 			return err
-		} else if _, err = tx.CreateBucket([]byte("frames")); err != nil {
+		} else if _, err = tx.CreateBucket([]byte("frame")); err != nil {
 			// Create frame bucket
 			return err
-		} else if _, err = tx.CreateBucket([]byte("frames-starts")); err != nil {
+		} else if _, err = tx.CreateBucket([]byte("frame-start")); err != nil {
 			// Create starts & ends bucket
 			return err
 		}
-		_, err = tx.CreateBucket([]byte("frames-ends"))
+		_, err = tx.CreateBucket([]byte("frame-end"))
 		return err
 	})
 	return err
 }
 
 
-func Write(label string, csv_stream io.Reader) error {
+func Write(db *bolt.DB, label string, csv_stream io.Reader) error {
 	var schema *Schema
-	db, err := bolt.Open("test.db", 0600, nil)
-	err = db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket([]byte(label))
-		if err != nil {
-			return err
+		if bkt == nil {
+			return errors.New("Missing label bucket")
 		}
 		value := bkt.Get([]byte("schema"))
-		ns := NewNetString(value)
+		ns := NewNetString(string(value))
 		columns := ns.Decode()
 		schema_ := Schema(columns)
 		schema = &schema_
 		return ns.err
 	})
+
 	if err != nil {
 		return err
 	}
@@ -380,7 +374,13 @@ func Write(label string, csv_stream io.Reader) error {
 	// Transaction closure
 	err = db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket([]byte(label))
-		frame_bkt := bkt.Bucket([]byte("frames"))
+		if bkt == nil {
+			return errors.New("Missing label bucket")
+		}
+		frame_bkt := bkt.Bucket([]byte("frame"))
+		if frame_bkt == nil {
+			return errors.New("Missing frame bucket")
+		}
 
 		// Create a bucket.
 		for fr = range frame_chan {
@@ -400,23 +400,19 @@ func Write(label string, csv_stream io.Reader) error {
 	return err
 }
 
-func Read() error {
+func Read(db *bolt.DB) error {
 	// Load csv and fill chan with chunks
 	// Connect db
 	if len(os.Args) < 2 {
 		log.Fatal("Not enough arguments")
 	}
 	label := os.Args[1]
-	db, err := bolt.Open("test.db", 0600, nil)
-	if err != nil {
-		return err
-	}
 
 	// Transaction closure
-	err = db.Update(func(tx *bolt.Tx) error {
+	err := db.Update(func(tx *bolt.Tx) error {
 		// Create a bucket.
 		bkt := tx.Bucket([]byte(label))
-		err = bkt.ForEach(func(k, v []byte) error {
+		err := bkt.ForEach(func(k, v []byte) error {
 			fmt.Printf("A %s is %v.\n", k, len(v))
 			return nil
 		})
