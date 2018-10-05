@@ -6,17 +6,17 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"github.com/boltdb/bolt"
+	"github.com/etcd-io/bbolt"
 	"github.com/couchbase/vellum"
 	"io"
-	"log"
-	"os"
+	// "log"
+	// "os"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-const CHUNK_SIZE = 1000000 // Must be < 2^32
+const CHUNK_SIZE = 100000 // Must be < 2^32
 
 type Schema []string
 type Frame struct {
@@ -130,12 +130,30 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 		return
 	}
 
+	// Identify position of each column
+	col_idx := make(map[int]string)
+	for _, col := range schema {
+		found := false
+		for pos, header := range headers {
+			if header == col {
+				found = true
+				col_idx[pos] = col
+			}
+		}
+		// Column not found
+		if !found {
+			err := fmt.Errorf("Missing column: %v", col)
+			frame_chan <- &Frame{err: err}
+			return
+		}
+	}
+
 	for {
 		frame := NewFrame(schema)
-		pos := 0
+		row := 0
 		for {
-			pos += 1
-			if pos > CHUNK_SIZE {
+			row += 1
+			if row > CHUNK_SIZE {
 				frame_chan <- frame
 				break
 			}
@@ -151,15 +169,15 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 				return
 			}
 
-			for pos, header := range headers {
-				frame.Data[header] = append(frame.Data[header], record[pos])
+			for i, col := range col_idx {
+				frame.Data[col] = append(frame.Data[col], record[i])
 			}
 		}
 	}
 
 }
 
-func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
+func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
@@ -217,10 +235,11 @@ func saveFrame(bkt *bolt.Bucket, frame *Frame) error {
 	if ns.err != nil {
 		return ns.err
 	}
-	key,err := bkt.NextSequence()
+	key, err := bkt.NextSequence()
 	if err != nil {
 		return err
 	}
+	println(key, len(payload))
 	err = bkt.Put(itob(key), payload)
 	return err
 }
@@ -293,7 +312,7 @@ func Basename(s string) string {
 }
 
 
-func CreateLabel(db *bolt.DB, name string, columns []string) error {
+func CreateLabel(db *bbolt.DB, name string, columns []string) error {
     // DB organisation:
     //
     // - label_1
@@ -318,7 +337,7 @@ func CreateLabel(db *bolt.DB, name string, columns []string) error {
 		return errors.New("Number of columns in schema should be at least 2")
 	}
 
-	err := db.Update(func(tx *bolt.Tx) error {
+	err := db.Update(func(tx *bbolt.Tx) error {
 		bkt, err := tx.CreateBucket([]byte(name))
 		if err != nil {
 			return err
@@ -332,10 +351,10 @@ func CreateLabel(db *bolt.DB, name string, columns []string) error {
 		if err = bkt.Put([]byte("schema"), schema); err != nil {
 			// Save schema
 			return err
-		} else if _, err = tx.CreateBucket([]byte("frame")); err != nil {
+		} else if _, err = bkt.CreateBucket([]byte("frame")); err != nil {
 			// Create frame bucket
 			return err
-		} else if _, err = tx.CreateBucket([]byte("frame-start")); err != nil {
+		} else if _, err = bkt.CreateBucket([]byte("frame-start")); err != nil {
 			// Create starts & ends bucket
 			return err
 		}
@@ -346,9 +365,9 @@ func CreateLabel(db *bolt.DB, name string, columns []string) error {
 }
 
 
-func Write(db *bolt.DB, label string, csv_stream io.Reader) error {
+func GetSchema(db *bbolt.DB, label string) (*Schema, error) {
 	var schema *Schema
-	err := db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bbolt.Tx) error {
 		bkt := tx.Bucket([]byte(label))
 		if bkt == nil {
 			return errors.New("Missing label bucket")
@@ -358,9 +377,13 @@ func Write(db *bolt.DB, label string, csv_stream io.Reader) error {
 		columns := ns.Decode()
 		schema_ := Schema(columns)
 		schema = &schema_
-		return ns.err
+		return nil
 	})
+	return schema, err
+}
 
+func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
+	schema, err := GetSchema(db, label)
 	if err != nil {
 		return err
 	}
@@ -372,7 +395,7 @@ func Write(db *bolt.DB, label string, csv_stream io.Reader) error {
 	pos := 0
 
 	// Transaction closure
-	err = db.Update(func(tx *bolt.Tx) error {
+	err = db.Update(func(tx *bbolt.Tx) error {
 		bkt := tx.Bucket([]byte(label))
 		if bkt == nil {
 			return errors.New("Missing label bucket")
@@ -382,12 +405,15 @@ func Write(db *bolt.DB, label string, csv_stream io.Reader) error {
 			return errors.New("Missing frame bucket")
 		}
 
-		// Create a bucket.
+		// Save each chunk
 		for fr = range frame_chan {
 			if fr.err != nil {
 				return fr.err
 			}
-			saveFrame(frame_bkt, fr)
+			err = saveFrame(frame_bkt, fr)
+			if err != nil {
+				return err
+			}
 			pos++
 		}
 		return nil
@@ -400,27 +426,40 @@ func Write(db *bolt.DB, label string, csv_stream io.Reader) error {
 	return err
 }
 
-func Read(db *bolt.DB) error {
-	// Load csv and fill chan with chunks
-	// Connect db
-	if len(os.Args) < 2 {
-		log.Fatal("Not enough arguments")
-	}
-	label := os.Args[1]
-
+func Read(db *bbolt.DB, label string) error {
 	// Transaction closure
-	err := db.Update(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bbolt.Tx) error {
 		// Create a bucket.
 		bkt := tx.Bucket([]byte(label))
-		err := bkt.ForEach(func(k, v []byte) error {
-			fmt.Printf("A %s is %v.\n", k, len(v))
+		if bkt == nil {
+			return errors.New("Missing label bucket")
+		}
+		frame_bkt := bkt.Bucket([]byte("frame"))
+		if frame_bkt == nil {
+			return errors.New("Missing frame bucket")
+		}
+		err := frame_bkt.ForEach(func(k, v []byte) error {
+			fmt.Printf("A %s size is %v.\n", binary.BigEndian.Uint64(k), len(v))
+			ns := NewNetString(string(v))
+			items := ns.Decode()
+			println(len(items))
+			frame := items[len(items) - 1]
+			fst, err := vellum.Load([]byte(frame))
+			if err != nil {
+				return err
+			}
+			itr, err := fst.Iterator([]byte("0"), []byte("z"))
+			for err == nil {
+				key, val := itr.Current()
+				fmt.Printf("contains key: %s val: %d", key, val)
+				err = itr.Next()
+			}
+			if err != nil {
+				return err
+			}
 			return nil
 		})
-		if err != nil {
-			return err
-		}
-
-		return nil
+		return err
 	})
 	return err
 }

@@ -6,11 +6,12 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"github.com/boltdb/bolt"
+	"github.com/etcd-io/bbolt"
 	"github.com/bclicn/color"
 	"os"
 	"log"
 	"time"
+	"strings"
 )
 
 func unravel(err error) {
@@ -24,26 +25,25 @@ func main() {
 	start := time.Now()
 	db_name := flag.String("db", "ldm.db", "Database file")
 	file := flag.String("f", "", "Input/Output file")
-	read_label := flag.String("r", "", "Read label")
-	write_label := flag.String("w", "", "Write label")
 	create_label := flag.String("c", "", "New label")
+	write_label := flag.String("w", "", "Write label")
+	read_label := flag.String("r", "", "Read label")
+	info := flag.String("i", "", "Print label info")
 	schema := flag.String("s", "", "Schema")
 	flag.Parse()
 
-	fmt.Println(*file, *db_name, "" == *read_label, *write_label, *create_label)
+
 
 	if *db_name == "" {
 		*db_name = "ldm.db"
 	}
-	db, err := bolt.Open(*db_name, 0600, nil)
+	db, err := bbolt.Open(*db_name, 0600, nil)
 	if err != nil {
 		unravel(err)
 	}
 
 	// Create label
-	 if *read_label != "" {
-		 fmt.Println("Read not implemented )-:")
-	 } else if *create_label != "" {
+	if *create_label != "" {
 		if *schema == "" {
 			log.Fatal("Missing -s argument")
 		}
@@ -65,6 +65,13 @@ func main() {
 			err = londinium.Write(db, *write_label, fh)
 			unravel(err)
 		}
+	} else if *read_label != "" {
+		err := londinium.Read(db, *read_label)
+		unravel(err)		
+	} else if *info != "" {
+		schema, err := londinium.GetSchema(db, *info)
+		unravel(err)
+		fmt.Println("Schema:", strings.Join(*schema, ", "))
 	}
 
 	elapsed := time.Since(start)
