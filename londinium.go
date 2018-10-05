@@ -448,10 +448,11 @@ func Read(db *bbolt.DB, label string) error {
 			if err != nil {
 				return err
 			}
-			itr, err := fst.Iterator([]byte("0"), []byte("z"))
+			itr, err := fst.Iterator([]byte{0}, []byte{1})
 			for err == nil {
 				key, val := itr.Current()
-				fmt.Printf("contains key: %s val: %d", key, val)
+				// TODO conver val to float
+				fmt.Printf("val: %d", key, val/1000)
 				err = itr.Next()
 			}
 			if err != nil {
