@@ -57,6 +57,29 @@ func (self *Frame) KeyWidth() int {
 	return len(self.KeyColumns)
 }
 
+func (self *Frame) Row(offset int) []byte {
+	var buffer bytes.Buffer
+	buff_p := &buffer
+	w := csv.NewWriter(buff_p)
+	record := make([]string, len(self.KeyColumns))
+	for pos, col := range self.KeyColumns {
+		record[pos] = self.Data[col][offset]
+	}
+	w.WriteAll([][]string{record})
+
+	if err := w.Error(); err != nil {
+		panic(err) // TODO
+	}
+	return buffer.Bytes()
+}
+
+func (self *Frame) StartKey() []byte {
+	return self.Row(0)
+}
+
+func (self *Frame) EndKey() []byte {
+	return self.Row(self.Len() - 1)
+}
 
 // Netstring decode & encode
 func NewNetString(values ...string) *NetString{
@@ -140,6 +163,7 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 	// Read a csv and feed the frame_chan with frames of size
 	// CHUNK_SIZE or less
 	r := csv.NewReader(fh)
+	// r.ReuseRecord = true // TODO enable for go >= 1.9
 	headers, err := r.Read()
 	if err != nil {
 		frame_chan <- &Frame{err: err}
@@ -190,7 +214,6 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 			}
 		}
 	}
-
 }
 
 func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
@@ -424,14 +447,26 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if err != nil {
 				return err
 			}
-			key, err := frame_bkt.NextSequence()
+			seq, err := frame_bkt.NextSequence()
 			if err != nil {
 				return err
 			}
-			err = frame_bkt.Put(itob(key), payload)
+			key := itob(seq)
+			err = frame_bkt.Put(key, payload)
 			if err != nil {
 				return err
 			}
+			start_bkt := bkt.Bucket([]byte("starts"))
+			if start_bkt == nil {
+				return errors.New("Missing start bucket")
+			}
+			start_bkt.Put(key, fr.StartKey())
+			end_bkt := bkt.Bucket([]byte("ends"))
+			if end_bkt == nil {
+				return errors.New("Missing end bucket")
+			}
+			end_bkt.Put(key, fr.EndKey())
+
 			// TODO update frame-start & frame-end
 			pos++
 		}
