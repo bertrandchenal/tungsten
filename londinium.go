@@ -67,12 +67,12 @@ func NewNetString(values ...string) *NetString{
 	return &NetString{buffer, nil}
 }
 
-func (self *NetString) Encode(items ...string) {
+func (self *NetString) Encode(items ...[]byte) {
 	tail := ","
 	for _, item := range items {
 		head := fmt.Sprintf("%d:", len(item))
 		_, err := self.buffer.WriteString(head)
-		_, err = self.buffer.WriteString(item)
+		_, err = self.buffer.Write(item)
 		_, err = self.buffer.WriteString(tail)
 		if err != nil && self.err != nil {
 			self.err = err
@@ -82,10 +82,10 @@ func (self *NetString) Encode(items ...string) {
 }
 
 // Netstring decoding
-func (self *NetString) Decode() []string {
+func (self *NetString) Decode() [][]byte {
 	head, err := self.buffer.ReadBytes(byte(':'))
 	if err == io.EOF {
-		return make([]string, 0)
+		return make([][]byte, 0)
 	}
 	// Read header giving item size
 	length, err := strconv.ParseInt(string(head[:len(head)-1]), 10, 32)
@@ -100,7 +100,7 @@ func (self *NetString) Decode() []string {
 		self.err = err
 		return nil
 	}
-	res := []string{string(payload)}
+	res := [][]byte{payload}
 	// Read end delimiter
 	delim, err := self.buffer.ReadByte()
 	if err != nil {
@@ -119,6 +119,22 @@ func (self *NetString) Decode() []string {
 
 	return append(res, tail...)
 }
+
+func (self *NetString) DecodeString() []string {
+	res_bytes := self.Decode()
+	res := make([]string, len(res_bytes))
+	for pos, val := range res_bytes {
+		res[pos] = string(val)
+	}
+	return res
+}
+
+func (self *NetString) EncodeString(items ...string) {
+	for _, item := range items {
+		self.Encode([]byte(item))
+	}
+}
+
 
 func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 	// Read a csv and feed the frame_chan with frames of size
@@ -197,7 +213,7 @@ func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 		if rev.err != nil {
 			return rev.err
 		}
-		ns.Encode(rev.Index.String())
+		ns.Encode(rev.Index.Bytes())
 		if ns.err != nil {
 			return ns.err
 		}
@@ -230,7 +246,7 @@ func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 	builder.Close()
 
 	// Add main fst to netstring & save in db
-	ns.Encode(fst.String())
+	ns.Encode(fst.Bytes())
 	payload := ns.buffer.Bytes()
 	if ns.err != nil {
 		return ns.err
@@ -343,7 +359,7 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 			return err
 		}
 		ns := NewNetString()
-		ns.Encode(columns...)
+		ns.EncodeString(columns...)
 		schema := ns.buffer.Bytes()
 		if ns.err != nil {
 			return ns.err
@@ -374,7 +390,7 @@ func GetSchema(db *bbolt.DB, label string) (*Schema, error) {
 		}
 		value := bkt.Get([]byte("schema"))
 		ns := NewNetString(string(value))
-		columns := ns.Decode()
+		columns := ns.DecodeString()
 		schema_ := Schema(columns)
 		schema = &schema_
 		return nil
@@ -442,9 +458,8 @@ func Read(db *bbolt.DB, label string) error {
 			fmt.Printf("A %s size is %v.\n", binary.BigEndian.Uint64(k), len(v))
 			ns := NewNetString(string(v))
 			items := ns.Decode()
-			println(len(items))
 			frame := items[len(items) - 1]
-			fst, err := vellum.Load([]byte(frame))
+			fst, err := vellum.Load(frame)
 			if err != nil {
 				return err
 			}
