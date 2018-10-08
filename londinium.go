@@ -193,7 +193,7 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 
 }
 
-func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
+func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
@@ -211,11 +211,11 @@ func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 	for i := 0; i < frame.KeyWidth(); i++ {
 		rev := <- inbox
 		if rev.err != nil {
-			return rev.err
+			return nil, rev.err
 		}
 		ns.Encode(rev.Index.Bytes())
 		if ns.err != nil {
-			return ns.err
+			return nil, ns.err
 		}
 		reverse_map[rev.Name] = rev.Values
 	}
@@ -224,7 +224,7 @@ func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 	var fst bytes.Buffer
 	builder, err := vellum.New(&fst, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	key_len := len(reverse_map) * 4
 	values := frame.Data[frame.ValueColumn]
@@ -236,11 +236,11 @@ func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 		}
 		weight, err := strconv.ParseFloat(values[row], 64)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		err = builder.Insert(key, uint64(weight*1000))
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	builder.Close()
@@ -249,15 +249,9 @@ func saveFrame(bkt *bbolt.Bucket, frame *Frame) error {
 	ns.Encode(fst.Bytes())
 	payload := ns.buffer.Bytes()
 	if ns.err != nil {
-		return ns.err
+		return nil, ns.err
 	}
-	key, err := bkt.NextSequence()
-	if err != nil {
-		return err
-	}
-	println(key, len(payload))
-	err = bkt.Put(itob(key), payload)
-	return err
+	return payload, nil
 }
 
 func itob(v uint64) []byte {
@@ -426,10 +420,19 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if fr.err != nil {
 				return fr.err
 			}
-			err = saveFrame(frame_bkt, fr)
+			payload, err := serializeFrame(frame_bkt, fr)
 			if err != nil {
 				return err
 			}
+			key, err := frame_bkt.NextSequence()
+			if err != nil {
+				return err
+			}
+			err = frame_bkt.Put(itob(key), payload)
+			if err != nil {
+				return err
+			}
+			// TODO update frame-start & frame-end
 			pos++
 		}
 		return nil
