@@ -350,15 +350,15 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
     //
     // - label_1
     //   - schema: netstring list of cols
-    //   - frames:
+    //   - segment:
     //     - 0x1: frame-blob (netsting of chunks)
     //     - ...
     //     - 0x3f6: fst
-    //   - frame-starts:
+    //   - start:
     //     - key_1: 0x1
     //     - ...
     //     - key_n: 0x3f6: fst
-    //   - frame-ends:
+    //   - end:
     //     - key_1: 0x1
     //     - ...
     //     - key_n: 0x3f6: fst
@@ -384,14 +384,14 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 		if err = bkt.Put([]byte("schema"), schema); err != nil {
 			// Save schema
 			return err
-		} else if _, err = bkt.CreateBucket([]byte("frame")); err != nil {
+		} else if _, err = bkt.CreateBucket([]byte("segment")); err != nil {
 			// Create frame bucket
 			return err
-		} else if _, err = bkt.CreateBucket([]byte("frame-start")); err != nil {
+		} else if _, err = bkt.CreateBucket([]byte("start")); err != nil {
 			// Create starts & ends bucket
 			return err
 		}
-		_, err = tx.CreateBucket([]byte("frame-end"))
+		_, err = bkt.CreateBucket([]byte("end"))
 		return err
 	})
 	return err
@@ -425,7 +425,6 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 	frame_chan := make(chan *Frame)
 	var fr *Frame
 	go loadCsv(csv_stream, *schema, frame_chan)
-	pos := 0
 
 	// Transaction closure
 	err = db.Update(func(tx *bbolt.Tx) error {
@@ -433,7 +432,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 		if bkt == nil {
 			return errors.New("Missing label bucket")
 		}
-		frame_bkt := bkt.Bucket([]byte("frame"))
+		frame_bkt := bkt.Bucket([]byte("segment"))
 		if frame_bkt == nil {
 			return errors.New("Missing frame bucket")
 		}
@@ -456,19 +455,24 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if err != nil {
 				return err
 			}
-			start_bkt := bkt.Bucket([]byte("starts"))
+			// Add first line of csv to start index
+			start_bkt := bkt.Bucket([]byte("start"))
 			if start_bkt == nil {
-				return errors.New("Missing start bucket")
+				return errors.New("Missing 'starts' bucket")
+			} // TODO KEEP REFERENCE TO EXISTING SEGMENT IF KEY IS ALREADY IN BUCKET
+			err = start_bkt.Put(key, fr.StartKey())
+			if err != nil {
+				return err
 			}
-			start_bkt.Put(key, fr.StartKey())
-			end_bkt := bkt.Bucket([]byte("ends"))
+			// Add last line of csv to end index
+			end_bkt := bkt.Bucket([]byte("end"))
 			if end_bkt == nil {
-				return errors.New("Missing end bucket")
+				return errors.New("Missing 'ends' bucket")
 			}
-			end_bkt.Put(key, fr.EndKey())
-
-			// TODO update frame-start & frame-end
-			pos++
+			err = end_bkt.Put(key, fr.EndKey())
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -488,7 +492,7 @@ func Read(db *bbolt.DB, label string) error {
 		if bkt == nil {
 			return errors.New("Missing label bucket")
 		}
-		frame_bkt := bkt.Bucket([]byte("frame"))
+		frame_bkt := bkt.Bucket([]byte("segment"))
 		if frame_bkt == nil {
 			return errors.New("Missing frame bucket")
 		}
