@@ -9,7 +9,7 @@ import (
 	"github.com/etcd-io/bbolt"
 	"github.com/couchbase/vellum"
 	"io"
-	// "log"
+	"log"
 	// "os"
 	"sort"
 	"strconv"
@@ -220,13 +220,13 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 	// Compute index for every column of the frame, save those and
 	// save the fst
 	inbox := make(chan *Indexer, frame.Len())
-	for _, header := range frame.KeyColumns {
-		go func(header string) {
+	go func() {
+		for _, header := range frame.KeyColumns {
 			indexer := buildIndex(frame.Data[header])
 			indexer.Name = header
 			inbox <- indexer
-		}(header)
-	}
+		}
+	}()
 
 	ns := NewNetString()
 	// Wait for every index to be created and save them
@@ -236,7 +236,7 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 		if rev.err != nil {
 			return nil, rev.err
 		}
-		ns.Encode(rev.Index.Bytes())
+		ns.Encode(rev.Index.Bytes()) // FIXME OUT OF ORDER WRITE !
 		if ns.err != nil {
 			return nil, ns.err
 		}
@@ -314,13 +314,11 @@ func buildIndex(arr []string) (*Indexer) {
 		return &Indexer{err: err}
 	}
 
-
 	// Use index to compute reverse array
 	fst, err := vellum.Load(idx.Bytes())
 		if err != nil {
 		return &Indexer{err: err}
 	}
-
 	for pos, item := range arr {
 		id, exists, err := fst.Get([]byte(item))
 		if err != nil {
@@ -484,6 +482,37 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 	return err
 }
 
+
+type Mapper struct {
+	id2name map[uint32][]byte
+}
+
+func buildMapper(idx []byte) *Mapper {
+	fst, err := vellum.Load(idx)
+	if err != nil {
+		panic(err)
+	}
+	id2name := make(map[uint32][]byte, fst.Len())
+	itr, err := fst.Iterator(nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	for err == nil {
+		key, val := itr.Current()
+		id2name[uint32(val)] = key
+		err = itr.Next()
+	}
+	return &Mapper{id2name}
+}
+
+func (self *Mapper) MapItem(id uint32) []byte {
+	res, ok := self.id2name[id]
+	if !ok {
+		log.Fatal("Unexpected value: ", id, len(self.id2name))
+	}
+	return res
+}
+
 func Read(db *bbolt.DB, label string) error {
 	// Transaction closure
 	err := db.View(func(tx *bbolt.Tx) error {
@@ -497,21 +526,32 @@ func Read(db *bbolt.DB, label string) error {
 			return errors.New("Missing frame bucket")
 		}
 		err := segment_bkt.ForEach(func(k, v []byte) error {
-			fmt.Printf("Segment %d size is %v.\n", binary.BigEndian.Uint64(k), len(v))
+			fmt.Printf("\nSegment %d size is %v.\n", binary.BigEndian.Uint64(k), len(v))
 			ns := NewNetString(string(v))
 			items := ns.Decode()
 			frame := items[len(items) - 1]
+			indexes := items[:len(items) - 1]
+			var mappers []*Mapper
+			for _, idx := range(indexes) {
+				mappers = append(mappers, buildMapper(idx))
+			}
 			fst, err := vellum.Load(frame)
 			if err != nil {
 				return err
 			}
-			itr, err := fst.Iterator([]byte{0}, []byte{1})
+			itr, err := fst.Iterator(nil, nil)
 			for err == nil {
-				key, val := itr.Current()
+				key, val := itr.Current()				
+				for pos, mapper := range(mappers) {
+					buff := key[pos*4 : (pos+1)*4]
+					id := binary.BigEndian.Uint32(buff)
+					value := mapper.MapItem(id)
+					fmt.Print(string(value))
+				}
+					fmt.Print(val, "\n")
 				// TODO conver val to float
-				fmt.Printf("\nkey: %d, val: %d\n", key, val/1000)
-				it_err := itr.Next()
-				if it_err != nil {
+				// fmt.Printf("key: %d, val: %d\n", key, val/1000)
+				if itr.Next() != nil {
 					break
 				}
 			}
