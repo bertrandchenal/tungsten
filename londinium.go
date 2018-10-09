@@ -432,8 +432,8 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 		if bkt == nil {
 			return errors.New("Missing label bucket")
 		}
-		frame_bkt := bkt.Bucket([]byte("segment"))
-		if frame_bkt == nil {
+		segment_bkt := bkt.Bucket([]byte("segment"))
+		if segment_bkt == nil {
 			return errors.New("Missing frame bucket")
 		}
 
@@ -442,16 +442,16 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if fr.err != nil {
 				return fr.err
 			}
-			payload, err := serializeFrame(frame_bkt, fr)
+			payload, err := serializeFrame(segment_bkt, fr)
 			if err != nil {
 				return err
 			}
-			seq, err := frame_bkt.NextSequence()
+			seq, err := segment_bkt.NextSequence()
 			if err != nil {
 				return err
 			}
 			key := itob(seq)
-			err = frame_bkt.Put(key, payload)
+			err = segment_bkt.Put(key, payload)
 			if err != nil {
 				return err
 			}
@@ -492,12 +492,12 @@ func Read(db *bbolt.DB, label string) error {
 		if bkt == nil {
 			return errors.New("Missing label bucket")
 		}
-		frame_bkt := bkt.Bucket([]byte("segment"))
-		if frame_bkt == nil {
+		segment_bkt := bkt.Bucket([]byte("segment"))
+		if segment_bkt == nil {
 			return errors.New("Missing frame bucket")
 		}
-		err := frame_bkt.ForEach(func(k, v []byte) error {
-			fmt.Printf("A %s size is %v.\n", binary.BigEndian.Uint64(k), len(v))
+		err := segment_bkt.ForEach(func(k, v []byte) error {
+			fmt.Printf("Segment %d size is %v.\n", binary.BigEndian.Uint64(k), len(v))
 			ns := NewNetString(string(v))
 			items := ns.Decode()
 			frame := items[len(items) - 1]
@@ -509,8 +509,11 @@ func Read(db *bbolt.DB, label string) error {
 			for err == nil {
 				key, val := itr.Current()
 				// TODO conver val to float
-				fmt.Printf("val: %d", key, val/1000)
-				err = itr.Next()
+				fmt.Printf("\nkey: %d, val: %d\n", key, val/1000)
+				it_err := itr.Next()
+				if it_err != nil {
+					break
+				}
 			}
 			if err != nil {
 				return err
