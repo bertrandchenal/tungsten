@@ -9,8 +9,8 @@ import (
 	"github.com/etcd-io/bbolt"
 	"github.com/couchbase/vellum"
 	"io"
-	"log"
-	// "os"
+	// "log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -192,7 +192,6 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 		frame := NewFrame(schema)
 		row := 0
 		for {
-			row += 1
 			if row > CHUNK_SIZE {
 				frame_chan <- frame
 				break
@@ -200,7 +199,9 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 			record, err := r.Read()
 			if err == io.EOF {
 				// Send trailing rows and stop
-				frame_chan <- frame
+				if row > 1 {
+					frame_chan <- frame
+				}
 				close(frame_chan)
 				return
 			}
@@ -212,6 +213,7 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 			for i, col := range col_idx {
 				frame.Data[col] = append(frame.Data[col], record[i])
 			}
+			row += 1
 		}
 	}
 }
@@ -484,7 +486,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 
 
 type Mapper struct {
-	id2name map[uint32][]byte
+	id2name [][]byte
 }
 
 func buildMapper(idx []byte) *Mapper {
@@ -492,24 +494,21 @@ func buildMapper(idx []byte) *Mapper {
 	if err != nil {
 		panic(err)
 	}
-	id2name := make(map[uint32][]byte, fst.Len())
+	id2name := make([][]byte, fst.Len())
 	itr, err := fst.Iterator(nil, nil)
 	if err != nil {
 		panic(err)
 	}
 	for err == nil {
 		key, val := itr.Current()
-		id2name[uint32(val)] = key
+		id2name[int(val)] = key
 		err = itr.Next()
 	}
 	return &Mapper{id2name}
 }
 
 func (self *Mapper) MapItem(id uint32) []byte {
-	res, ok := self.id2name[id]
-	if !ok {
-		log.Fatal("Unexpected value: ", id, len(self.id2name))
-	}
+	res := self.id2name[id]
 	return res
 }
 
@@ -525,8 +524,9 @@ func Read(db *bbolt.DB, label string) error {
 		if segment_bkt == nil {
 			return errors.New("Missing frame bucket")
 		}
+		csv_writer := csv.NewWriter(os.Stdout)
 		err := segment_bkt.ForEach(func(k, v []byte) error {
-			fmt.Printf("\nSegment %d size is %v.\n", binary.BigEndian.Uint64(k), len(v))
+			// TODO implement a goroutine to parallelize decode-load and iteration
 			ns := NewNetString(string(v))
 			items := ns.Decode()
 			frame := items[len(items) - 1]
@@ -540,17 +540,17 @@ func Read(db *bbolt.DB, label string) error {
 				return err
 			}
 			itr, err := fst.Iterator(nil, nil)
+			mapper_len := len(mappers)
+			record := make([]string, mapper_len + 1)
 			for err == nil {
 				key, val := itr.Current()				
 				for pos, mapper := range(mappers) {
 					buff := key[pos*4 : (pos+1)*4]
 					id := binary.BigEndian.Uint32(buff)
-					value := mapper.MapItem(id)
-					fmt.Print(string(value))
+					record[pos] = string(mapper.MapItem(id))
 				}
-					fmt.Print(val, "\n")
-				// TODO conver val to float
-				// fmt.Printf("key: %d, val: %d\n", key, val/1000)
+				record[mapper_len] = strconv.FormatUint(val, 10) // FIXME Write must take negative values into account
+				csv_writer.Write(record)
 				if itr.Next() != nil {
 					break
 				}
