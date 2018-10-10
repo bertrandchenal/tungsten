@@ -6,8 +6,8 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"github.com/etcd-io/bbolt"
 	"github.com/couchbase/vellum"
+	"github.com/etcd-io/bbolt"
 	"io"
 	// "log"
 	"math"
@@ -19,7 +19,6 @@ import (
 
 const CHUNK_SIZE = 100000 // Must be < 2^32
 const CONV_FACTOR = 10000
-
 
 func check(err error) {
 	if err != nil {
@@ -33,18 +32,18 @@ type Frame struct {
 	KeyColumns  []string
 	ValueColumn string
 	Data        map[string][]string
-	err error
+	err         error
 }
 type Indexer struct {
 	Index  bytes.Buffer
 	Values []uint32
 	Name   string
-	err error
+	err    error
 }
 
 type NetString struct {
 	buffer bytes.Buffer
-    err error
+	err    error
 }
 
 func NewFrame(schema Schema) *Frame {
@@ -91,7 +90,7 @@ func (self *Frame) EndKey() []byte {
 }
 
 // Netstring decode & encode
-func NewNetBytes(values ...[]byte) *NetString{
+func NewNetBytes(values ...[]byte) *NetString {
 	var buffer bytes.Buffer
 	for _, val := range values {
 		buffer.Write(val)
@@ -99,7 +98,7 @@ func NewNetBytes(values ...[]byte) *NetString{
 	return &NetString{buffer, nil}
 }
 
-func NewNetString(values ...string) *NetString{
+func NewNetString(values ...string) *NetString {
 	var buffer bytes.Buffer
 	for _, val := range values {
 		buffer.WriteString(val)
@@ -174,7 +173,6 @@ func (self *NetString) EncodeString(items ...string) {
 		self.Encode([]byte(item))
 	}
 }
-
 
 func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 	// Read a csv and feed the frame_chan with frames of size
@@ -251,7 +249,7 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 	// Save indexes
 	reverse_map := make(map[string][]uint32)
 	for i := 0; i < frame.KeyWidth(); i++ {
-		rev := <- inbox
+		rev := <-inbox
 		if rev.err != nil {
 			return nil, rev.err
 		}
@@ -322,12 +320,12 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 }
 
 func itob(v uint64) []byte {
-    b := make([]byte, 8)
-    binary.BigEndian.PutUint64(b, v)
-    return b
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, v)
+	return b
 }
 
-func buildIndex(arr []string) (*Indexer) {
+func buildIndex(arr []string) *Indexer {
 	// Sort input
 	tmp := make([]string, len(arr))
 	reverse := make([]uint32, len(arr))
@@ -336,7 +334,7 @@ func buildIndex(arr []string) (*Indexer) {
 	// Build index in-memory
 	var idx bytes.Buffer
 	builder, err := vellum.New(&idx, nil)
-		if err != nil {
+	if err != nil {
 		return &Indexer{err: err}
 	}
 
@@ -359,7 +357,7 @@ func buildIndex(arr []string) (*Indexer) {
 
 	// Use index to compute reverse array
 	fst, err := vellum.Load(idx.Bytes())
-		if err != nil {
+	if err != nil {
 		return &Indexer{err: err}
 	}
 	for pos, item := range arr {
@@ -385,28 +383,27 @@ func Basename(s string) string {
 	return s
 }
 
-
 func CreateLabel(db *bbolt.DB, name string, columns []string) error {
-    // DB organisation:
-    //
-    // - label_1
-    //   - schema: netstring list of cols
-    //   - segment:
-    //     - 0x1: frame-blob (netsting of chunks)
-    //     - ...
-    //     - 0x3f6: fst
-    //   - start:
-    //     - key_1: 0x1
-    //     - ...
-    //     - key_n: 0x3f6: fst
-    //   - end:
-    //     - key_1: 0x1
-    //     - ...
-    //     - key_n: 0x3f6: fst
-    // - ...
-    // - label_n
-    //
-    // Each chunk is a netstring of indexes fst, and data fst.
+	// DB organisation:
+	//
+	// - label_1
+	//   - schema: netstring list of cols
+	//   - segment:
+	//     - 0x1: frame-blob (netsting of chunks)
+	//     - ...
+	//     - 0x3f6: fst
+	//   - start:
+	//     - key_1: 0x1
+	//     - ...
+	//     - key_n: 0x3f6: fst
+	//   - end:
+	//     - key_1: 0x1
+	//     - ...
+	//     - key_n: 0x3f6: fst
+	// - ...
+	// - label_n
+	//
+	// Each chunk is a netstring of indexes fst, and data fst.
 	if len(columns) < 2 {
 		return errors.New("Number of columns in schema should be at least 2")
 	}
@@ -437,7 +434,6 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 	})
 	return err
 }
-
 
 func GetSchema(db *bbolt.DB, label string) (*Schema, error) {
 	var schema *Schema
@@ -525,7 +521,6 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 	return err
 }
 
-
 type Mapper struct {
 	id2name []string
 }
@@ -570,9 +565,9 @@ func Read(db *bbolt.DB, label string) error {
 			// TODO implement a goroutine to parallelize decode-load and iteration
 			ns := NewNetBytes(segment)
 			items := ns.Decode()
-			frame := items[len(items) - 1]
-			min_value_b := items[len(items) - 2]
-			conv_factor_b := items[len(items) - 3]
+			frame := items[len(items)-1]
+			min_value_b := items[len(items)-2]
+			conv_factor_b := items[len(items)-3]
 
 			// Extra conv_factor & min_value of value column
 			conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
@@ -584,9 +579,9 @@ func Read(db *bbolt.DB, label string) error {
 				return err
 			}
 
-			indexes := items[:len(items) - 3]
+			indexes := items[:len(items)-3]
 			var mappers []*Mapper
-			for _, idx := range(indexes) {
+			for _, idx := range indexes {
 				mappers = append(mappers, buildMapper(idx))
 			}
 			fst, err := vellum.Load(frame)
@@ -595,10 +590,10 @@ func Read(db *bbolt.DB, label string) error {
 			}
 			itr, err := fst.Iterator(nil, nil)
 			mapper_len := len(mappers)
-			record := make([]string, mapper_len + 1)
+			record := make([]string, mapper_len+1)
 			for err == nil {
 				key, val := itr.Current()
-				for pos, mapper := range(mappers) {
+				for pos, mapper := range mappers {
 					buff := key[pos*4 : (pos+1)*4]
 					id := binary.BigEndian.Uint32(buff)
 					record[pos] = mapper.MapItem(id)

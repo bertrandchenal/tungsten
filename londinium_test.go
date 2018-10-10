@@ -4,7 +4,6 @@ import (
 	"testing"
 )
 
-
 func TestNS(t *testing.T) {
 	var encoded = []string{
 		"Hello world!",
