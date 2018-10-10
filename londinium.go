@@ -10,6 +10,7 @@ import (
 	"github.com/couchbase/vellum"
 	"io"
 	// "log"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -17,6 +18,14 @@ import (
 )
 
 const CHUNK_SIZE = 100000 // Must be < 2^32
+const CONV_FACTOR = 10000
+
+
+func check(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
 
 type Schema []string
 type Frame struct {
@@ -82,6 +91,14 @@ func (self *Frame) EndKey() []byte {
 }
 
 // Netstring decode & encode
+func NewNetBytes(values ...[]byte) *NetString{
+	var buffer bytes.Buffer
+	for _, val := range values {
+		buffer.Write(val)
+	}
+	return &NetString{buffer, nil}
+}
+
 func NewNetString(values ...string) *NetString{
 	var buffer bytes.Buffer
 	for _, val := range values {
@@ -231,18 +248,45 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 	}()
 
 	ns := NewNetString()
-	// Wait for every index to be created and save them
+	// Save indexes
 	reverse_map := make(map[string][]uint32)
 	for i := 0; i < frame.KeyWidth(); i++ {
 		rev := <- inbox
 		if rev.err != nil {
 			return nil, rev.err
 		}
-		ns.Encode(rev.Index.Bytes()) // FIXME OUT OF ORDER WRITE !
+
+		ns.Encode(rev.Index.Bytes())
 		if ns.err != nil {
 			return nil, ns.err
 		}
 		reverse_map[rev.Name] = rev.Values
+	}
+	// Convert value column to float & compute min
+	int_values := make([]uint64, frame.Len())
+	float_values := make([]float64, frame.Len())
+	min_value := math.MaxFloat64
+	for pos, v := range frame.Data[frame.ValueColumn] {
+		float_v, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(err)
+		}
+		float_values[pos] = float_v
+		min_value = math.Min(float_v, min_value)
+	}
+	// Convert float to int
+	for pos, float_v := range float_values {
+		int_v := uint64((float_v - min_value) * CONV_FACTOR)
+		int_values[pos] = int_v
+	}
+	// Save factor & min_value
+	ns.EncodeString(strconv.FormatFloat(CONV_FACTOR, 'E', -1, 64))
+	if ns.err != nil {
+		return nil, ns.err
+	}
+	ns.EncodeString(strconv.FormatFloat(min_value, 'E', -1, 64))
+	if ns.err != nil {
+		return nil, ns.err
 	}
 
 	// TODO: some column may only need 2 bytes (aka uint16)
@@ -252,18 +296,16 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 		return nil, err
 	}
 	key_len := len(reverse_map) * 4
-	values := frame.Data[frame.ValueColumn]
 	for row := 0; row < frame.Len(); row++ {
 		key := make([]byte, key_len)
 		for pos, colname := range frame.KeyColumns {
 			buff := key[pos*4 : (pos+1)*4]
 			binary.BigEndian.PutUint32(buff, reverse_map[colname][row])
 		}
-		weight, err := strconv.ParseFloat(values[row], 64)
 		if err != nil {
 			return nil, err
 		}
-		err = builder.Insert(key, uint64(weight*1000))
+		err = builder.Insert(key, int_values[row])
 		if err != nil {
 			return nil, err
 		}
@@ -291,7 +333,6 @@ func buildIndex(arr []string) (*Indexer) {
 	reverse := make([]uint32, len(arr))
 	copy(tmp, arr)
 	sort.Strings(tmp)
-
 	// Build index in-memory
 	var idx bytes.Buffer
 	builder, err := vellum.New(&idx, nil)
@@ -486,7 +527,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 
 
 type Mapper struct {
-	id2name [][]byte
+	id2name []string
 }
 
 func buildMapper(idx []byte) *Mapper {
@@ -494,20 +535,20 @@ func buildMapper(idx []byte) *Mapper {
 	if err != nil {
 		panic(err)
 	}
-	id2name := make([][]byte, fst.Len())
+	id2name := make([]string, fst.Len())
 	itr, err := fst.Iterator(nil, nil)
 	if err != nil {
 		panic(err)
 	}
 	for err == nil {
 		key, val := itr.Current()
-		id2name[int(val)] = key
+		id2name[int(val)] = string(key)
 		err = itr.Next()
 	}
 	return &Mapper{id2name}
 }
 
-func (self *Mapper) MapItem(id uint32) []byte {
+func (self *Mapper) MapItem(id uint32) string {
 	res := self.id2name[id]
 	return res
 }
@@ -525,12 +566,25 @@ func Read(db *bbolt.DB, label string) error {
 			return errors.New("Missing frame bucket")
 		}
 		csv_writer := csv.NewWriter(os.Stdout)
-		err := segment_bkt.ForEach(func(k, v []byte) error {
+		err := segment_bkt.ForEach(func(k, segment []byte) error {
 			// TODO implement a goroutine to parallelize decode-load and iteration
-			ns := NewNetString(string(v))
+			ns := NewNetBytes(segment)
 			items := ns.Decode()
 			frame := items[len(items) - 1]
-			indexes := items[:len(items) - 1]
+			min_value_b := items[len(items) - 2]
+			conv_factor_b := items[len(items) - 3]
+
+			// Extra conv_factor & min_value of value column
+			conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
+			if err != nil {
+				return err
+			}
+			min_value, err := strconv.ParseFloat(string(min_value_b), 64)
+			if err != nil {
+				return err
+			}
+
+			indexes := items[:len(items) - 3]
 			var mappers []*Mapper
 			for _, idx := range(indexes) {
 				mappers = append(mappers, buildMapper(idx))
@@ -543,14 +597,16 @@ func Read(db *bbolt.DB, label string) error {
 			mapper_len := len(mappers)
 			record := make([]string, mapper_len + 1)
 			for err == nil {
-				key, val := itr.Current()				
+				key, val := itr.Current()
 				for pos, mapper := range(mappers) {
 					buff := key[pos*4 : (pos+1)*4]
 					id := binary.BigEndian.Uint32(buff)
-					record[pos] = string(mapper.MapItem(id))
+					record[pos] = mapper.MapItem(id)
 				}
-				record[mapper_len] = strconv.FormatUint(val, 10) // FIXME Write must take negative values into account
-				csv_writer.Write(record)
+				val_f := (float64(val) / conv_factor) + min_value
+				record[mapper_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
+				err := csv_writer.Write(record)
+				check(err)
 				if itr.Next() != nil {
 					break
 				}
@@ -560,6 +616,7 @@ func Read(db *bbolt.DB, label string) error {
 			}
 			return nil
 		})
+		csv_writer.Flush()
 		return err
 	})
 	return err
