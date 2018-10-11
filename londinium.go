@@ -11,7 +11,7 @@ import (
 	"io"
 	// "log"
 	"math"
-	"os"
+	// "os"
 	"sort"
 	"strconv"
 	"strings"
@@ -294,8 +294,8 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 		return nil, err
 	}
 	key_len := len(reverse_map) * 4
+	key := make([]byte, key_len)
 	for row := 0; row < frame.Len(); row++ {
-		key := make([]byte, key_len)
 		for pos, colname := range frame.KeyColumns {
 			buff := key[pos*4 : (pos+1)*4]
 			binary.BigEndian.PutUint32(buff, reverse_map[colname][row])
@@ -548,7 +548,7 @@ func (self *Mapper) MapItem(id uint32) string {
 	return res
 }
 
-func Read(db *bbolt.DB, label string) error {
+func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 	// Transaction closure
 	err := db.View(func(tx *bbolt.Tx) error {
 		// Create a bucket.
@@ -560,14 +560,15 @@ func Read(db *bbolt.DB, label string) error {
 		if segment_bkt == nil {
 			return errors.New("Missing frame bucket")
 		}
-		csv_writer := csv.NewWriter(os.Stdout)
+		csv_writer := csv.NewWriter(csv_stream)
 		err := segment_bkt.ForEach(func(k, segment []byte) error {
 			// TODO implement a goroutine to parallelize decode-load and iteration
 			ns := NewNetBytes(segment)
 			items := ns.Decode()
-			frame := items[len(items)-1]
-			min_value_b := items[len(items)-2]
+			indexes := items[:len(items)-3]
 			conv_factor_b := items[len(items)-3]
+			min_value_b := items[len(items)-2]
+			frame := items[len(items)-1]
 
 			// Extra conv_factor & min_value of value column
 			conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
@@ -579,7 +580,6 @@ func Read(db *bbolt.DB, label string) error {
 				return err
 			}
 
-			indexes := items[:len(items)-3]
 			var mappers []*Mapper
 			for _, idx := range indexes {
 				mappers = append(mappers, buildMapper(idx))

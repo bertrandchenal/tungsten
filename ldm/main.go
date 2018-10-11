@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/etcd-io/bbolt"
 	"github.com/bclicn/color"
+	"io"
 	"os"
 	"log"
 	"time"
@@ -54,19 +55,26 @@ func main() {
 		}
 		unravel(err)
 	} else if *write_label != "" {
+		var fh io.ReadCloser
 		if *file == "" {
-			fh := os.Stdin
-			err := londinium.Write(db, *write_label, fh)
-			unravel(err)
+			fh = os.Stdin
 		} else {
-			fh, err := os.Open(*file)
-			unravel(err)
-			defer fh.Close()
-			err = londinium.Write(db, *write_label, fh)
+			fh, err = os.Open(*file)
 			unravel(err)
 		}
+		defer fh.Close()
+		err = londinium.Write(db, *write_label, fh)
+		unravel(err)
 	} else if *read_label != "" {
-		err := londinium.Read(db, *read_label)
+		var fh io.WriteCloser
+		if *file == "" {
+			fh = os.Stdout
+		} else {
+			fh, err = os.OpenFile(*file, os.O_RDWR|os.O_CREATE, 0755)
+			unravel(err)
+		}
+		defer fh.Close()
+		err := londinium.Read(db, *read_label, fh)
 		unravel(err)		
 	} else if *info != "" {
 		schema, err := londinium.GetSchema(db, *info)
