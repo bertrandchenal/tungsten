@@ -27,14 +27,14 @@ func check(err error) {
 }
 
 type Schema []string
-type Frame struct {
+type Segment struct {
 	Schema      []string
 	KeyColumns  []string
 	ValueColumn string
 	Data        map[string][]string
 	err         error
 }
-type Indexer struct {
+type Column struct {
 	Index  bytes.Buffer
 	Values []uint32
 	Name   string
@@ -46,26 +46,26 @@ type NetString struct {
 	err    error
 }
 
-func NewFrame(schema Schema) *Frame {
+func NewSegment(schema Schema) *Segment {
 	data := make(map[string][]string)
 	key_columns := schema[:len(schema)-1]
 	value_column := schema[len(schema)-1]
-	return &Frame{schema, key_columns, value_column, data, nil}
+	return &Segment{schema, key_columns, value_column, data, nil}
 }
 
-func (self *Frame) Len() int {
+func (self *Segment) Len() int {
 	return len(self.Data[self.ValueColumn])
 }
 
-func (self *Frame) Width() int {
+func (self *Segment) Width() int {
 	return len(self.Data)
 }
 
-func (self *Frame) KeyWidth() int {
+func (self *Segment) KeyWidth() int {
 	return len(self.KeyColumns)
 }
 
-func (self *Frame) Row(offset int) []byte {
+func (self *Segment) Row(offset int) []byte {
 	var buffer bytes.Buffer
 	buff_p := &buffer
 	w := csv.NewWriter(buff_p)
@@ -81,15 +81,15 @@ func (self *Frame) Row(offset int) []byte {
 	return buffer.Bytes()
 }
 
-func (self *Frame) StartKey() []byte {
+func (self *Segment) StartKey() []byte {
 	return self.Row(0)
 }
 
-func (self *Frame) EndKey() []byte {
+func (self *Segment) EndKey() []byte {
 	return self.Row(self.Len() - 1)
 }
 
-// Netstring decode & encode
+// Netstring constructors
 func NewNetBytes(values ...[]byte) *NetString {
 	var buffer bytes.Buffer
 	for _, val := range values {
@@ -106,6 +106,7 @@ func NewNetString(values ...string) *NetString {
 	return &NetString{buffer, nil}
 }
 
+// NetString encoding
 func (self *NetString) Encode(items ...[]byte) {
 	tail := ","
 	for _, item := range items {
@@ -117,6 +118,12 @@ func (self *NetString) Encode(items ...[]byte) {
 			self.err = err
 			return
 		}
+	}
+}
+
+func (self *NetString) EncodeString(items ...string) {
+	for _, item := range items {
+		self.Encode([]byte(item))
 	}
 }
 
@@ -168,20 +175,14 @@ func (self *NetString) DecodeString() []string {
 	return res
 }
 
-func (self *NetString) EncodeString(items ...string) {
-	for _, item := range items {
-		self.Encode([]byte(item))
-	}
-}
-
-func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
-	// Read a csv and feed the frame_chan with frames of size
+func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
+	// Read a csv and feed the segment_chan with segments of size
 	// CHUNK_SIZE or less
 	r := csv.NewReader(fh)
 	// r.ReuseRecord = true // TODO enable for go >= 1.9
 	headers, err := r.Read()
 	if err != nil {
-		frame_chan <- &Frame{err: err}
+		segment_chan <- &Segment{err: err}
 		return
 	}
 
@@ -198,73 +199,73 @@ func loadCsv(fh io.Reader, schema Schema, frame_chan chan *Frame) {
 		// Column not found
 		if !found {
 			err := fmt.Errorf("Missing column: %v", col)
-			frame_chan <- &Frame{err: err}
+			segment_chan <- &Segment{err: err}
 			return
 		}
 	}
 
 	for {
-		frame := NewFrame(schema)
+		segment := NewSegment(schema)
 		row := 0
 		for {
 			if row > CHUNK_SIZE {
-				frame_chan <- frame
+				segment_chan <- segment
 				break
 			}
 			record, err := r.Read()
 			if err == io.EOF {
 				// Send trailing rows and stop
 				if row > 1 {
-					frame_chan <- frame
+					segment_chan <- segment
 				}
-				close(frame_chan)
+				close(segment_chan)
 				return
 			}
 			if err != nil {
-				frame_chan <- &Frame{err: err}
+				segment_chan <- &Segment{err: err}
 				return
 			}
 
 			for i, col := range col_idx {
-				frame.Data[col] = append(frame.Data[col], record[i])
+				segment.Data[col] = append(segment.Data[col], record[i])
 			}
 			row += 1
 		}
 	}
 }
 
-func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
-	// Compute index for every column of the frame, save those and
+func serializeSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
+	// Compute index for every column of the segment, save those and
 	// save the fst
-	inbox := make(chan *Indexer, frame.Len())
+	inbox := make(chan *Column, segment.Len())
 	go func() {
-		for _, header := range frame.KeyColumns {
-			indexer := buildIndex(frame.Data[header])
-			indexer.Name = header
-			inbox <- indexer
+		for _, header := range segment.KeyColumns {
+			column := buildIndex(segment.Data[header])
+			column.Name = header
+			inbox <- column
 		}
 	}()
-
 	ns := NewNetString()
 	// Save indexes
-	reverse_map := make(map[string][]uint32)
-	for i := 0; i < frame.KeyWidth(); i++ {
-		rev := <-inbox
-		if rev.err != nil {
-			return nil, rev.err
+	data_map := make(map[string][]uint32)
+	for i := 0; i < segment.KeyWidth(); i++ {
+		col := <-inbox
+		if col.err != nil {
+			return nil, col.err
 		}
-
-		ns.Encode(rev.Index.Bytes())
+		// Save the index in netstring
+		ns.Encode(col.Index.Bytes())
 		if ns.err != nil {
 			return nil, ns.err
 		}
-		reverse_map[rev.Name] = rev.Values
+		// Keep values (aka references to index)
+		data_map[col.Name] = col.Values
 	}
 	// Convert value column to float & compute min
-	int_values := make([]uint64, frame.Len())
-	float_values := make([]float64, frame.Len())
+	int_values := make([]uint64, segment.Len())
+	float_values := make([]float64, segment.Len())
 	min_value := math.MaxFloat64
-	for pos, v := range frame.Data[frame.ValueColumn] {
+	for pos, v := range segment.Data[segment.ValueColumn] {
 		float_v, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			panic(err)
@@ -286,19 +287,18 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 	if ns.err != nil {
 		return nil, ns.err
 	}
-
 	// TODO: some column may only need 2 bytes (aka uint16)
 	var fst bytes.Buffer
 	builder, err := vellum.New(&fst, nil)
 	if err != nil {
 		return nil, err
 	}
-	key_len := len(reverse_map) * 4
+	key_len := len(data_map) * 4
 	key := make([]byte, key_len)
-	for row := 0; row < frame.Len(); row++ {
-		for pos, colname := range frame.KeyColumns {
+	for row := 0; row < segment.Len(); row++ {
+		for pos, colname := range segment.KeyColumns {
 			buff := key[pos*4 : (pos+1)*4]
-			binary.BigEndian.PutUint32(buff, reverse_map[colname][row])
+			binary.BigEndian.PutUint32(buff, data_map[colname][row])
 		}
 		if err != nil {
 			return nil, err
@@ -309,7 +309,6 @@ func serializeFrame(bkt *bbolt.Bucket, frame *Frame) ([]byte, error) {
 		}
 	}
 	builder.Close()
-
 	// Add main fst to netstring & save in db
 	ns.Encode(fst.Bytes())
 	payload := ns.buffer.Bytes()
@@ -325,17 +324,17 @@ func itob(v uint64) []byte {
 	return b
 }
 
-func buildIndex(arr []string) *Indexer {
+func buildIndex(arr []string) *Column {
 	// Sort input
 	tmp := make([]string, len(arr))
 	reverse := make([]uint32, len(arr))
 	copy(tmp, arr)
 	sort.Strings(tmp)
-	// Build index in-memory
+	// Build fst index in-memory
 	var idx bytes.Buffer
 	builder, err := vellum.New(&idx, nil)
 	if err != nil {
-		return &Indexer{err: err}
+		return &Column{err: err}
 	}
 
 	var prev string
@@ -352,18 +351,18 @@ func buildIndex(arr []string) *Indexer {
 
 	// Save fst
 	if err != nil {
-		return &Indexer{err: err}
+		return &Column{err: err}
 	}
 
 	// Use index to compute reverse array
 	fst, err := vellum.Load(idx.Bytes())
 	if err != nil {
-		return &Indexer{err: err}
+		return &Column{err: err}
 	}
 	for pos, item := range arr {
 		id, exists, err := fst.Get([]byte(item))
 		if err != nil {
-			return &Indexer{err: err}
+			return &Column{err: err}
 		}
 
 		if !exists {
@@ -372,7 +371,7 @@ func buildIndex(arr []string) *Indexer {
 		// TODO assert array len is less than 2^32
 		reverse[pos] = uint32(id)
 	}
-	return &Indexer{idx, reverse, "", nil}
+	return &Column{idx, reverse, "", nil}
 }
 
 func Basename(s string) string {
@@ -389,7 +388,7 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 	// - label_1
 	//   - schema: netstring list of cols
 	//   - segment:
-	//     - 0x1: frame-blob (netsting of chunks)
+	//     - 0x1: segment-blob (netsting of chunks)
 	//     - ...
 	//     - 0x3f6: fst
 	//   - start:
@@ -423,7 +422,7 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 			// Save schema
 			return err
 		} else if _, err = bkt.CreateBucket([]byte("segment")); err != nil {
-			// Create frame bucket
+			// Create segment bucket
 			return err
 		} else if _, err = bkt.CreateBucket([]byte("start")); err != nil {
 			// Create starts & ends bucket
@@ -459,9 +458,9 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 	}
 
 	// Load csv and fill chan with chunks
-	frame_chan := make(chan *Frame)
-	var fr *Frame
-	go loadCsv(csv_stream, *schema, frame_chan)
+	segment_chan := make(chan *Segment)
+	var fr *Segment
+	go loadCsv(csv_stream, *schema, segment_chan)
 
 	// Transaction closure
 	err = db.Update(func(tx *bbolt.Tx) error {
@@ -471,15 +470,15 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 		}
 		segment_bkt := bkt.Bucket([]byte("segment"))
 		if segment_bkt == nil {
-			return errors.New("Missing frame bucket")
+			return errors.New("Missing segment bucket")
 		}
 
 		// Save each chunk
-		for fr = range frame_chan {
+		for fr = range segment_chan {
 			if fr.err != nil {
 				return fr.err
 			}
-			payload, err := serializeFrame(segment_bkt, fr)
+			payload, err := serializeSegment(segment_bkt, fr)
 			if err != nil {
 				return err
 			}
@@ -521,11 +520,13 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 	return err
 }
 
-type Mapper struct {
+type Resolver struct {
 	id2name []string
 }
 
-func buildMapper(idx []byte) *Mapper {
+func NewResolver(idx []byte) *Resolver {
+	// Construct mapping between a string id and the string
+	// representation. Idx contains an fst which acts as a sorted set
 	fst, err := vellum.Load(idx)
 	if err != nil {
 		panic(err)
@@ -540,10 +541,10 @@ func buildMapper(idx []byte) *Mapper {
 		id2name[int(val)] = string(key)
 		err = itr.Next()
 	}
-	return &Mapper{id2name}
+	return &Resolver{id2name}
 }
 
-func (self *Mapper) MapItem(id uint32) string {
+func (self *Resolver) Get(id uint32) string {
 	res := self.id2name[id]
 	return res
 }
@@ -558,7 +559,7 @@ func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 		}
 		segment_bkt := bkt.Bucket([]byte("segment"))
 		if segment_bkt == nil {
-			return errors.New("Missing frame bucket")
+			return errors.New("Missing segment bucket")
 		}
 		csv_writer := csv.NewWriter(csv_stream)
 		err := segment_bkt.ForEach(func(k, segment []byte) error {
@@ -568,7 +569,7 @@ func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 			indexes := items[:len(items)-3]
 			conv_factor_b := items[len(items)-3]
 			min_value_b := items[len(items)-2]
-			frame := items[len(items)-1]
+			data := items[len(items)-1]
 
 			// Extra conv_factor & min_value of value column
 			conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
@@ -580,26 +581,26 @@ func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 				return err
 			}
 
-			var mappers []*Mapper
+			var resolvers []*Resolver
 			for _, idx := range indexes {
-				mappers = append(mappers, buildMapper(idx))
+				resolvers = append(resolvers, NewResolver(idx))
 			}
-			fst, err := vellum.Load(frame)
+			fst, err := vellum.Load(data)
 			if err != nil {
 				return err
 			}
 			itr, err := fst.Iterator(nil, nil)
-			mapper_len := len(mappers)
-			record := make([]string, mapper_len+1)
+			resolver_len := len(resolvers)
+			record := make([]string, resolver_len+1)
 			for err == nil {
 				key, val := itr.Current()
-				for pos, mapper := range mappers {
+				for pos, resolver := range resolvers {
 					buff := key[pos*4 : (pos+1)*4]
 					id := binary.BigEndian.Uint32(buff)
-					record[pos] = mapper.MapItem(id)
+					record[pos] = resolver.Get(id)
 				}
 				val_f := (float64(val) / conv_factor) + min_value
-				record[mapper_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
+				record[resolver_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
 				err := csv_writer.Write(record)
 				check(err)
 				if itr.Next() != nil {
