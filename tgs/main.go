@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bitbucket.org/bertrandchenal/londinium"
+	"bitbucket.org/bertrandchenal/tungsten"
 	"bytes"
 	"encoding/csv"
 	"flag"
@@ -24,7 +24,7 @@ func unravel(err error) {
 
 func main() {
 	start := time.Now()
-	db_name := flag.String("db", "ldm.db", "Database file")
+	db_name := flag.String("db", "tungsten.db", "Database file")
 	file := flag.String("f", "", "Input/Output file")
 	create_label := flag.String("c", "", "New label")
 	write_label := flag.String("w", "", "Write label")
@@ -51,7 +51,7 @@ func main() {
 		csvReader := csv.NewReader(bytes.NewBuffer([]byte(*schema)))
 		columns, err := csvReader.Read()
 		if err == nil {
-			err = londinium.CreateLabel(db, *create_label, columns)
+			err = tungsten.CreateLabel(db, *create_label, columns)
 		}
 		unravel(err)
 	} else if *write_label != "" {
@@ -63,7 +63,7 @@ func main() {
 			unravel(err)
 		}
 		defer fh.Close()
-		err = londinium.Write(db, *write_label, fh)
+		err = tungsten.Write(db, *write_label, fh)
 		unravel(err)
 	} else if *read_label != "" {
 		var fh io.WriteCloser
@@ -74,10 +74,10 @@ func main() {
 			unravel(err)
 		}
 		defer fh.Close()
-		err := londinium.Read(db, *read_label, fh)
+		err := tungsten.Read(db, *read_label, fh)
 		unravel(err)		
 	} else if *info != "" {
-		schema, err := londinium.GetSchema(db, *info)
+		schema, err := tungsten.GetSchema(db, *info)
 		unravel(err)
 		fmt.Println("Schema:", strings.Join(*schema, ", "))
 	}
