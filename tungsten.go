@@ -18,7 +18,7 @@ import (
 	"strings"
 )
 
-const CHUNK_SIZE = 100000 // Must be < 2^32
+const CHUNK_SIZE = 1e6 // Must be < 2^32
 const CONV_FACTOR = 10000
 
 func check(err error) {
