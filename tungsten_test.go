@@ -1,8 +1,22 @@
 package tungsten
 
 import (
+	"github.com/etcd-io/bbolt"
+	"os"
+	"path"
 	"testing"
 )
+
+const test_dir = "test-data"
+const db_name = "tungsten-test.db"
+
+func cleanup() {
+	err := os.Remove(path.Join(test_dir, db_name))
+	if err != nil {
+		println("--> ", err.Error())
+	}
+}
+
 
 func TestNS(t *testing.T) {
 	var encoded = []string{
@@ -30,4 +44,27 @@ func TestNS(t *testing.T) {
 			t.Error("Decoding error")
 		}
 	}
+}
+
+
+func TestEndtoEnd(t *testing.T) {
+	cleanup()
+	db, err := bbolt.Open(path.Join(test_dir, db_name), 0600, nil)
+	if err != nil {
+		t.Error(err)
+	}
+	// Create label
+	label := "test"
+	columns := []string{"x","y","z"}
+	err = CreateLabel(db, label, columns)
+	if err != nil {
+		t.Error(err)
+	}
+	// Add data
+	input_fh, err := os.Open(path.Join(test_dir, "basic.csv"))
+	if err != nil {
+		t.Error(err)
+	}
+	defer input_fh.Close()
+	err = Write(db, label, input_fh)
 }
