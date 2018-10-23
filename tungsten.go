@@ -21,11 +21,6 @@ import (
 const CHUNK_SIZE = 1e6 // Must be < 2^32
 const CONV_FACTOR = 10000
 
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
 
 type Schema []string
 type Segment struct {
@@ -288,7 +283,7 @@ func serializeSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	if ns.err != nil {
 		return nil, ns.err
 	}
-	// TODO: some column may only need 2 bytes (aka uint16)
+	// Use columns id to encode main fst
 	var fst bytes.Buffer
 	builder, err := vellum.New(&fst, nil)
 	if err != nil {
@@ -513,11 +508,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
 
-	err = db.Close()
 	return err
 }
 
@@ -563,6 +554,10 @@ func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 			return errors.New("Missing segment bucket")
 		}
 		csv_writer := csv.NewWriter(csv_stream)
+		schema_b := bkt.Get([]byte("schema"))
+		ns := NewNetBytes(schema_b)
+		schema := ns.DecodeString()
+		csv_writer.Write(schema)
 		err := segment_bkt.ForEach(func(k, segment []byte) error {
 			// TODO implement a goroutine to parallelize decode-load and iteration
 			ns := NewNetBytes(segment)
@@ -603,7 +598,9 @@ func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 				val_f := (float64(val) / conv_factor) + min_value
 				record[resolver_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
 				err := csv_writer.Write(record)
-				check(err)
+				if err != nil {
+					return err
+				}
 				if itr.Next() != nil {
 					break
 				}
