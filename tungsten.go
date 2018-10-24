@@ -314,6 +314,57 @@ func serializeSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	return payload, nil
 }
 
+func serializeSimpleSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
+	ns := NewNetString()
+	// Convert value column to float & compute min
+	int_values := make([]uint64, segment.Len())
+	float_values := make([]float64, segment.Len())
+	min_value := math.MaxFloat64
+	for pos, v := range segment.Data[segment.ValueColumn] {
+		float_v, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(err)
+		}
+		float_values[pos] = float_v
+		min_value = math.Min(float_v, min_value)
+	}
+	// Convert float to int
+	for pos, float_v := range float_values {
+		int_v := uint64((float_v - min_value) * CONV_FACTOR)
+		int_values[pos] = int_v
+	}
+	// Save factor & min_value
+	ns.EncodeString(strconv.FormatFloat(CONV_FACTOR, 'E', -1, 64))
+	if ns.err != nil {
+		return nil, ns.err
+	}
+	ns.EncodeString(strconv.FormatFloat(min_value, 'E', -1, 64))
+	if ns.err != nil {
+		return nil, ns.err
+	}
+	// Encode main fst
+	var fst bytes.Buffer
+	builder, err := vellum.New(&fst, nil)
+	if err != nil {
+		return nil, err
+	}
+	column := segment.Data[segment.KeyColumns[0]]
+	for pos, val := range column {
+		err = builder.Insert([]byte(val), int_values[pos])
+		if err != nil {
+			return nil, err
+		}
+	}
+	builder.Close()
+	// Add main fst to netstring & save in db
+	ns.Encode(fst.Bytes())
+	payload := ns.buffer.Bytes()
+	if ns.err != nil {
+		return nil, ns.err
+	}
+	return payload, nil
+}
+
 func itob(v uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, v)
@@ -470,13 +521,21 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 		}
 
 		// Save each chunk
+		var payload []byte
 		for fr = range segment_chan {
 			if fr.err != nil {
 				return fr.err
 			}
-			payload, err := serializeSegment(segment_bkt, fr)
-			if err != nil {
-				return err
+			if len(*schema) > 2 {TODO ADAP READ
+				payload, err = serializeSegment(segment_bkt, fr)
+				if err != nil {
+					return err
+				}
+			} else {
+				payload, err = serializeSimpleSegment(segment_bkt, fr)
+				if err != nil {
+					return err
+				}
 			}
 			seq, err := segment_bkt.NextSequence()
 			if err != nil {
