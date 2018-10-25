@@ -85,6 +85,99 @@ func (self *Segment) EndKey() []byte {
 	return self.Row(self.Len() - 1)
 }
 
+func SegmentToCSV(segment []byte, csv_writer *csv.Writer) error {
+	// TODO implement a goroutine to parallelize decode-load and iteration
+	ns := NewNetBytes(segment)
+	items := ns.Decode()
+	indexes := items[:len(items)-3]
+	conv_factor_b := items[len(items)-3]
+	min_value_b := items[len(items)-2]
+	data := items[len(items)-1]
+	// Extra conv_factor & min_value of value column
+	conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
+	if err != nil {
+		return err
+	}
+	min_value, err := strconv.ParseFloat(string(min_value_b), 64)
+	if err != nil {
+		return err
+	}
+	var resolvers []*Resolver
+	for _, idx := range indexes {
+		resolvers = append(resolvers, NewResolver(idx))
+	}
+	fst, err := vellum.Load(data)
+	if err != nil {
+		return err
+	}
+	itr, err := fst.Iterator(nil, nil)
+	resolver_len := len(resolvers)
+	record := make([]string, resolver_len+1)
+	for err == nil {
+		key, val := itr.Current()
+		for pos, resolver := range resolvers {
+			buff := key[pos*4 : (pos+1)*4]
+			id := binary.BigEndian.Uint32(buff)
+			record[pos] = resolver.Get(id)
+		}
+		val_f := (float64(val) / conv_factor) + min_value
+		record[resolver_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
+		err := csv_writer.Write(record)
+		if err != nil {
+			return err
+		}
+		if itr.Next() != nil {
+			break
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+
+func SimpleSegmentToCSV(segment []byte, csv_writer *csv.Writer) error {
+	// TODO implement a goroutine to parallelize decode-load and iteration
+	ns := NewNetBytes(segment)
+	items := ns.Decode()
+	conv_factor_b := items[len(items)-3]
+	min_value_b := items[len(items)-2]
+	data := items[len(items)-1]
+	// Extra conv_factor & min_value of value column
+	conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
+	if err != nil {
+		return err
+	}
+	min_value, err := strconv.ParseFloat(string(min_value_b), 64)
+	if err != nil {
+		return err
+	}
+	fst, err := vellum.Load(data)
+	if err != nil {
+		return err
+	}
+	itr, err := fst.Iterator(nil, nil)
+	record := make([]string, 2)
+	for err == nil {
+		key, val := itr.Current()
+		val_f := (float64(val) / conv_factor) + min_value
+		record[0] = string(key)
+		record[1] = strconv.FormatFloat(val_f, 'f', -1, 64)
+		err := csv_writer.Write(record)
+		if err != nil {
+			return err
+		}
+		if itr.Next() != nil {
+			break
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // Netstring constructors
 func NewNetBytes(values ...[]byte) *NetString {
 	var buffer bytes.Buffer
@@ -526,7 +619,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if fr.err != nil {
 				return fr.err
 			}
-			if len(*schema) > 2 {TODO ADAP READ
+			if len(*schema) > 2 {
 				payload, err = serializeSegment(segment_bkt, fr)
 				if err != nil {
 					return err
@@ -550,7 +643,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			start_bkt := bkt.Bucket([]byte("start"))
 			if start_bkt == nil {
 				return errors.New("Missing 'starts' bucket")
-			} // TODO KEEP REFERENCE TO EXISTING SEGMENT IF KEY IS ALREADY IN BUCKET
+			} // TODO append ref to existing segment if key is already in bucket
 			err = start_bkt.Put(key, fr.StartKey())
 			if err != nil {
 				return err
@@ -600,6 +693,8 @@ func (self *Resolver) Get(id uint32) string {
 	return res
 }
 
+
+
 func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 	// Transaction closure
 	err := db.View(func(tx *bbolt.Tx) error {
@@ -617,57 +712,14 @@ func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
 		ns := NewNetBytes(schema_b)
 		schema := ns.DecodeString()
 		csv_writer.Write(schema)
-		err := segment_bkt.ForEach(func(k, segment []byte) error {
-			// TODO implement a goroutine to parallelize decode-load and iteration
-			ns := NewNetBytes(segment)
-			items := ns.Decode()
-			indexes := items[:len(items)-3]
-			conv_factor_b := items[len(items)-3]
-			min_value_b := items[len(items)-2]
-			data := items[len(items)-1]
-
-			// Extra conv_factor & min_value of value column
-			conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
-			if err != nil {
-				return err
+		err := segment_bkt.ForEach(func(key, segment []byte) error {
+			var err error
+			if len(schema) > 2 {
+				err = SegmentToCSV(segment, csv_writer)
+			} else {
+				err = SimpleSegmentToCSV(segment, csv_writer)
 			}
-			min_value, err := strconv.ParseFloat(string(min_value_b), 64)
-			if err != nil {
-				return err
-			}
-
-			var resolvers []*Resolver
-			for _, idx := range indexes {
-				resolvers = append(resolvers, NewResolver(idx))
-			}
-			fst, err := vellum.Load(data)
-			if err != nil {
-				return err
-			}
-			itr, err := fst.Iterator(nil, nil)
-			resolver_len := len(resolvers)
-			record := make([]string, resolver_len+1)
-			for err == nil {
-				key, val := itr.Current()
-				for pos, resolver := range resolvers {
-					buff := key[pos*4 : (pos+1)*4]
-					id := binary.BigEndian.Uint32(buff)
-					record[pos] = resolver.Get(id)
-				}
-				val_f := (float64(val) / conv_factor) + min_value
-				record[resolver_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
-				err := csv_writer.Write(record)
-				if err != nil {
-					return err
-				}
-				if itr.Next() != nil {
-					break
-				}
-			}
-			if err != nil {
-				return err
-			}
-			return nil
+			return err
 		})
 		csv_writer.Flush()
 		return err
