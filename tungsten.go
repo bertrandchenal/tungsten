@@ -53,6 +53,14 @@ func (self *Segment) Len() int {
 	return len(self.Data[self.ValueColumn])
 }
 
+func (self *Segment) Key(pos int) []byte {
+	ns := NewNetString()
+	for _, col := range self.KeyColumns {
+		ns.EncodeString(self.Data[col][pos])
+	}
+	return ns.buffer.Bytes()
+}
+
 func (self *Segment) Width() int {
 	return len(self.Data)
 }
@@ -61,28 +69,13 @@ func (self *Segment) KeyWidth() int {
 	return len(self.KeyColumns)
 }
 
-func (self *Segment) Row(offset int) []byte {
-	var buffer bytes.Buffer
-	buff_p := &buffer
-	w := csv.NewWriter(buff_p)
-	record := make([]string, len(self.KeyColumns))
-	for pos, col := range self.KeyColumns {
-		record[pos] = self.Data[col][offset]
-	}
-	w.WriteAll([][]string{record})
-
-	if err := w.Error(); err != nil {
-		panic(err) // TODO
-	}
-	return buffer.Bytes()
-}
 
 func (self *Segment) StartKey() []byte {
-	return self.Row(0)
+	return self.Key(0)
 }
 
 func (self *Segment) EndKey() []byte {
-	return self.Row(self.Len() - 1)
+	return self.Key(self.Len() - 1)
 }
 
 func SegmentToCSV(segment []byte, csv_writer *csv.Writer) error {
