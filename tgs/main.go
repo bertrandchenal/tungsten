@@ -39,6 +39,7 @@ func main() {
 		*db_name = "ldm.db"
 	}
 	db, err := bbolt.Open(*db_name, 0600, nil)
+	defer db.Close()
 	if err != nil {
 		unravel(err)
 	}

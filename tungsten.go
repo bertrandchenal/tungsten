@@ -27,12 +27,24 @@ type Segment struct {
 	Schema      []string
 	KeyColumns  []string
 	ValueColumn string
-	Data        map[string][]string
+	Records []*Record
 	err         error
 }
-type Column struct {
-	Index  bytes.Buffer
-	Values []uint32
+
+type Record struct {
+	Data      []string
+	Value float64
+	err error
+}
+
+func NewRecord(length int) *Record {
+	data:= make([]string, length)
+	return &Record{data, 0, nil}
+}
+
+type Index struct {
+	Buff  bytes.Buffer
+	Reverse []uint32
 	Name   string
 	err    error
 }
@@ -43,26 +55,37 @@ type NetString struct {
 }
 
 func NewSegment(schema Schema) *Segment {
-	data := make(map[string][]string)
+	data := make([]*Record, CHUNK_SIZE / 2)
 	key_columns := schema[:len(schema)-1]
 	value_column := schema[len(schema)-1]
 	return &Segment{schema, key_columns, value_column, data, nil}
 }
 
-func (self *Segment) Len() int {
-	return len(self.Data[self.ValueColumn])
+func (self *Segment) Append(record *Record) {
+	self.Records = append(self.Records, record)
 }
 
-func (self *Segment) Key(pos int) []byte {
-	ns := NewNetString()
-	for _, col := range self.KeyColumns {
-		ns.EncodeString(self.Data[col][pos])
-	}
+func (self *Segment) Len() int {
+	return len(self.Records)
+}
+
+func (self *Segment) Key(row int) []byte {
+	ns := NewNetString(self.Records[row].Data...)
 	return ns.buffer.Bytes()
 }
 
+func (self *Segment) ColPos(colName string) int {
+	for pos, col := range self.KeyColumns {
+		if col == colName {
+			return pos
+		}
+	}
+	return -1
+}
+
+
 func (self *Segment) Width() int {
-	return len(self.Data)
+	return len(self.Schema)
 }
 
 func (self *Segment) KeyWidth() int {
@@ -78,22 +101,22 @@ func (self *Segment) EndKey() []byte {
 	return self.Key(self.Len() - 1)
 }
 
-func SegmentToCSV(segment []byte, csv_writer *csv.Writer) error {
-	// TODO implement a goroutine to parallelize decode-load and iteration
-	ns := NewNetBytes(segment)
+
+func loadSegment(segment_b []byte, schema Schema) *Segment {
+	ns := NewNetBytes(segment_b)
 	items := ns.Decode()
-	indexes := items[:len(items)-3]
+	indexes := items[:len(items)-4]
 	conv_factor_b := items[len(items)-3]
 	min_value_b := items[len(items)-2]
 	data := items[len(items)-1]
-	// Extra conv_factor & min_value of value column
+	// Extract conv_factor & min_value of value column
 	conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
 	if err != nil {
-		return err
+		return &Segment{err:err}
 	}
 	min_value, err := strconv.ParseFloat(string(min_value_b), 64)
 	if err != nil {
-		return err
+		return &Segment{err:err}
 	}
 	var resolvers []*Resolver
 	for _, idx := range indexes {
@@ -101,75 +124,74 @@ func SegmentToCSV(segment []byte, csv_writer *csv.Writer) error {
 	}
 	fst, err := vellum.Load(data)
 	if err != nil {
-		return err
+		return &Segment{err:err}
 	}
-	itr, err := fst.Iterator(nil, nil)
+	fst_it, err := fst.Iterator(nil, nil)
+
 	resolver_len := len(resolvers)
-	record := make([]string, resolver_len+1)
-	for err == nil {
-		key, val := itr.Current()
+	sgm := NewSegment(schema)
+	for {
+		key, val := fst_it.Current()
+		record := NewRecord(resolver_len + 1)
 		for pos, resolver := range resolvers {
-			buff := key[pos*4 : (pos+1)*4]
+			buff := key[pos * 4:(pos + 1) * 4]
 			id := binary.BigEndian.Uint32(buff)
-			record[pos] = resolver.Get(id)
+			record.Data[pos] = resolver.Get(id)
 		}
 		val_f := (float64(val) / conv_factor) + min_value
-		record[resolver_len] = strconv.FormatFloat(val_f, 'f', -1, 64)
-		err := csv_writer.Write(record)
-		if err != nil {
-			return err
-		}
-		if itr.Next() != nil {
+		record.Value = val_f
+		sgm.Append(record)
+		if fst_it.Next() != nil {
 			break
 		}
 	}
-	if err != nil {
-		return err
-	}
-	return nil
+
+	fst_it.Close()
+	fst.Close()
+	return sgm
 }
 
 
-func SimpleSegmentToCSV(segment []byte, csv_writer *csv.Writer) error {
-	// TODO implement a goroutine to parallelize decode-load and iteration
-	ns := NewNetBytes(segment)
-	items := ns.Decode()
-	conv_factor_b := items[len(items)-3]
-	min_value_b := items[len(items)-2]
-	data := items[len(items)-1]
-	// Extra conv_factor & min_value of value column
-	conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
-	if err != nil {
-		return err
-	}
-	min_value, err := strconv.ParseFloat(string(min_value_b), 64)
-	if err != nil {
-		return err
-	}
-	fst, err := vellum.Load(data)
-	if err != nil {
-		return err
-	}
-	itr, err := fst.Iterator(nil, nil)
-	record := make([]string, 2)
-	for err == nil {
-		key, val := itr.Current()
-		val_f := (float64(val) / conv_factor) + min_value
-		record[0] = string(key)
-		record[1] = strconv.FormatFloat(val_f, 'f', -1, 64)
-		err := csv_writer.Write(record)
-		if err != nil {
-			return err
-		}
-		if itr.Next() != nil {
-			break
-		}
-	}
-	if err != nil {
-		return err
-	}
-	return nil
-}
+// func loadSimpleSegment(segment []byte, csv_writer *csv.Writer) error {
+// 	// TODO implement a goroutine to parallelize decode-load and iteration
+// 	ns := NewNetBytes(segment)
+// 	items := ns.Decode()
+// 	conv_factor_b := items[len(items)-3]
+// 	min_value_b := items[len(items)-2]
+// 	data := items[len(items)-1]
+// 	// Extra conv_factor & min_value of value column
+// 	conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	min_value, err := strconv.ParseFloat(string(min_value_b), 64)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	fst, err := vellum.Load(data)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	itr, err := fst.Iterator(nil, nil)
+// 	record := make([]string, 2)
+// 	for err == nil {
+// 		key, val := itr.Current()
+// 		val_f := (float64(val) / conv_factor) + min_value
+// 		record[0] = string(key)
+// 		record[1] = strconv.FormatFloat(val_f, 'f', -1, 64)
+// 		err := csv_writer.Write(record)
+// 		if err != nil {
+// 			return err
+// 		}
+// 		if itr.Next() != nil {
+// 			break
+// 		}
+// 	}
+// 	if err != nil {
+// 		return err
+// 	}
+// 	return nil
+// }
 
 // Netstring constructors
 func NewNetBytes(values ...[]byte) *NetString {
@@ -269,16 +291,15 @@ func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
 	}
 
 	// Identify position of each column
-	col_idx := make(map[int]string)
-	for _, col := range schema {
+	colIdx := make(map[int]int)
+	for schPos, col := range schema {
 		found := false
 		for pos, header := range headers {
 			if header == col {
 				found = true
-				col_idx[pos] = col
+				colIdx[schPos] = pos
 			}
 		}
-		// Column not found
 		if !found {
 			err := fmt.Errorf("Missing column: %v", col)
 			segment_chan <- &Segment{err: err}
@@ -294,7 +315,7 @@ func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
 				segment_chan <- segment
 				break
 			}
-			record, err := r.Read()
+			csv_record, err := r.Read()
 			if err == io.EOF {
 				// Send trailing rows and stop
 				if row > 1 {
@@ -308,46 +329,58 @@ func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
 				return
 			}
 
-			for i, col := range col_idx {
-				segment.Data[col] = append(segment.Data[col], record[i])
+			// Create and fill record
+			record := NewRecord(len(schema))
+			for schPos, _ := range(segment.KeyColumns) {
+				csvPos := colIdx[schPos]
+				record.Data[schPos] = csv_record[csvPos]
 			}
+			valPos := colIdx[len(schema) - 1]
+			val := csv_record[valPos]
+			record.Value, err = strconv.ParseFloat(val, 64)
+			if err != nil {
+				segment_chan <- &Segment{err: err}
+				return
+			}
+			segment.Append(record)
 			row += 1
 		}
 	}
 }
 
-func serializeSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
+func dumpSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	// Compute index for every column of the segment, save those and
 	// save the fst
-	inbox := make(chan *Column, segment.Len())
+	inbox := make(chan *Index, segment.Len())
 	go func() {
-		for _, header := range segment.KeyColumns {
-			column := buildIndex(segment.Data[header])
-			column.Name = header
-			inbox <- column
+		for _, colName := range segment.KeyColumns {
+			idx := segment.buildIndex(colName)
+			inbox <- idx
 		}
 	}()
 	ns := NewNetString()
 	// Save indexes
 	data_map := make(map[string][]uint32)
 	for i := 0; i < segment.KeyWidth(); i++ {
-		col := <-inbox
-		if col.err != nil {
-			return nil, col.err
+		idx := <- inbox
+		if idx.err != nil {
+			return nil, idx.err
 		}
 		// Save the index in netstring
-		ns.Encode(col.Index.Bytes())
+		ns.Encode(idx.Buff.Bytes())
 		if ns.err != nil {
 			return nil, ns.err
 		}
 		// Keep values (aka references to index)
-		data_map[col.Name] = col.Values
+		data_map[idx.Name] = idx.Reverse
 	}
 	// Convert value column to float & compute min
 	int_values := make([]uint64, segment.Len())
 	float_values := make([]float64, segment.Len())
 	min_value := math.MaxFloat64
-	for pos, v := range segment.Data[segment.ValueColumn] {
+	valuePos := segment.KeyWidth()
+	for pos, record := range segment.Records {
+		v := record.Data[valuePos]
 		float_v, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			panic(err)
@@ -377,6 +410,9 @@ func serializeSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	}
 	key_len := len(data_map) * 4
 	key := make([]byte, key_len)
+	// IDEA: serialize float values in a contigous array of float and
+	// simply reference it from the fst. This as the advantage of
+	// simplifying simple vs non-simple segment code
 	for row := 0; row < segment.Len(); row++ {
 		for pos, colname := range segment.KeyColumns {
 			buff := key[pos*4 : (pos+1)*4]
@@ -400,56 +436,56 @@ func serializeSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	return payload, nil
 }
 
-func serializeSimpleSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
-	ns := NewNetString()
-	// Convert value column to float & compute min
-	int_values := make([]uint64, segment.Len())
-	float_values := make([]float64, segment.Len())
-	min_value := math.MaxFloat64
-	for pos, v := range segment.Data[segment.ValueColumn] {
-		float_v, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			panic(err)
-		}
-		float_values[pos] = float_v
-		min_value = math.Min(float_v, min_value)
-	}
-	// Convert float to int
-	for pos, float_v := range float_values {
-		int_v := uint64((float_v - min_value) * CONV_FACTOR)
-		int_values[pos] = int_v
-	}
-	// Save factor & min_value
-	ns.EncodeString(strconv.FormatFloat(CONV_FACTOR, 'E', -1, 64))
-	if ns.err != nil {
-		return nil, ns.err
-	}
-	ns.EncodeString(strconv.FormatFloat(min_value, 'E', -1, 64))
-	if ns.err != nil {
-		return nil, ns.err
-	}
-	// Encode main fst
-	var fst bytes.Buffer
-	builder, err := vellum.New(&fst, nil)
-	if err != nil {
-		return nil, err
-	}
-	column := segment.Data[segment.KeyColumns[0]]
-	for pos, val := range column {
-		err = builder.Insert([]byte(val), int_values[pos])
-		if err != nil {
-			return nil, err
-		}
-	}
-	builder.Close()
-	// Add main fst to netstring & save in db
-	ns.Encode(fst.Bytes())
-	payload := ns.buffer.Bytes()
-	if ns.err != nil {
-		return nil, ns.err
-	}
-	return payload, nil
-}
+// func dumpSimpleSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
+// 	ns := NewNetString()
+// 	// Convert value column to float & compute min
+// 	int_values := make([]uint64, segment.Len())
+// 	float_values := make([]float64, segment.Len())
+// 	min_value := math.MaxFloat64
+// 	for pos, v := range segment.Data[segment.ValueColumn] {
+// 		float_v, err := strconv.ParseFloat(v, 64)
+// 		if err != nil {
+// 			panic(err)
+// 		}
+// 		float_values[pos] = float_v
+// 		min_value = math.Min(float_v, min_value)
+// 	}
+// 	// Convert float to int
+// 	for pos, float_v := range float_values {
+// 		int_v := uint64((float_v - min_value) * CONV_FACTOR)
+// 		int_values[pos] = int_v
+// 	}
+// 	// Save factor & min_value
+// 	ns.EncodeString(strconv.FormatFloat(CONV_FACTOR, 'E', -1, 64))
+// 	if ns.err != nil {
+// 		return nil, ns.err
+// 	}
+// 	ns.EncodeString(strconv.FormatFloat(min_value, 'E', -1, 64))
+// 	if ns.err != nil {
+// 		return nil, ns.err
+// 	}
+// 	// Encode main fst
+// 	var fst bytes.Buffer
+// 	builder, err := vellum.New(&fst, nil)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	column := segment.Data[segment.KeyColumns[0]]
+// 	for pos, val := range column {
+// 		err = builder.Insert([]byte(val), int_values[pos])
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 	}
+// 	builder.Close()
+// 	// Add main fst to netstring & save in db
+// 	ns.Encode(fst.Bytes())
+// 	payload := ns.buffer.Bytes()
+// 	if ns.err != nil {
+// 		return nil, ns.err
+// 	}
+// 	return payload, nil
+// }
 
 func itob(v uint64) []byte {
 	b := make([]byte, 8)
@@ -457,17 +493,21 @@ func itob(v uint64) []byte {
 	return b
 }
 
-func buildIndex(arr []string) *Column {
-	// Sort input
-	tmp := make([]string, len(arr))
-	reverse := make([]uint32, len(arr))
-	copy(tmp, arr)
+func (self *Segment) buildIndex(colName string) *Index {
+	// Organise values as column & sort it
+	length := self.Len()
+	colPos := self.ColPos(colName)
+	tmp := make([]string, length)
+	reverse := make([]uint32, length)
+	for i := 0; i < length; i++ {
+		tmp[i] = self.Records[i].Data[colPos]
+	}
 	sort.Strings(tmp)
 	// Build fst index in-memory
-	var idx bytes.Buffer
-	builder, err := vellum.New(&idx, nil)
+	var buff bytes.Buffer
+	builder, err := vellum.New(&buff, nil)
 	if err != nil {
-		return &Column{err: err}
+		return &Index{err: err}
 	}
 
 	var prev string
@@ -484,27 +524,28 @@ func buildIndex(arr []string) *Column {
 
 	// Save fst
 	if err != nil {
-		return &Column{err: err}
+		return &Index{err: err}
 	}
 
 	// Use index to compute reverse array
-	fst, err := vellum.Load(idx.Bytes())
+	fst, err := vellum.Load(buff.Bytes())
 	if err != nil {
-		return &Column{err: err}
+		return &Index{err: err}
 	}
-	for pos, item := range arr {
+	for i := 0; i < length; i++ {
+		item := self.Records[i].Data[colPos]
 		id, exists, err := fst.Get([]byte(item))
 		if err != nil {
-			return &Column{err: err}
+			return &Index{err: err}
 		}
 
 		if !exists {
 			panic("Fatal!")
 		}
 		// TODO assert array len is less than 2^32
-		reverse[pos] = uint32(id)
+		reverse[i] = uint32(id)
 	}
-	return &Column{idx, reverse, "", nil}
+	return &Index{buff, reverse, colName, nil}
 }
 
 func Basename(s string) string {
@@ -613,15 +654,16 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 				return fr.err
 			}
 			if len(*schema) > 2 {
-				payload, err = serializeSegment(segment_bkt, fr)
+				payload, err = dumpSegment(segment_bkt, fr)
 				if err != nil {
 					return err
 				}
 			} else {
-				payload, err = serializeSimpleSegment(segment_bkt, fr)
-				if err != nil {
-					return err
-				}
+				panic("Not Implemented")
+				// payload, err = dumpSimpleSegment(segment_bkt, fr)
+				// if err != nil {
+				// 	return err
+				// }
 			}
 			seq, err := segment_bkt.NextSequence()
 			if err != nil {
@@ -686,36 +728,53 @@ func (self *Resolver) Get(id uint32) string {
 	return res
 }
 
+type Reader struct {
+	tx *bbolt.Tx
+	label string
+	resChan chan *Segment
+}
 
+type CSVReader Reader // XXX s/Reader/Pipe/ ??
 
-func Read(db *bbolt.DB, label string, csv_stream io.Writer) error {
-	// Transaction closure
-	err := db.View(func(tx *bbolt.Tx) error {
-		// Create a bucket.
-		bkt := tx.Bucket([]byte(label))
-		if bkt == nil {
-			return errors.New("Missing label bucket")
-		}
-		segment_bkt := bkt.Bucket([]byte("segment"))
-		if segment_bkt == nil {
-			return errors.New("Missing segment bucket")
-		}
-		csv_writer := csv.NewWriter(csv_stream)
-		schema_b := bkt.Get([]byte("schema"))
-		ns := NewNetBytes(schema_b)
-		schema := ns.DecodeString()
-		csv_writer.Write(schema)
-		err := segment_bkt.ForEach(func(key, segment []byte) error {
-			var err error
-			if len(schema) > 2 {
-				err = SegmentToCSV(segment, csv_writer)
-			} else {
-				err = SimpleSegmentToCSV(segment, csv_writer)
+func NewCSVReader(db *bbolt.DB, label string) (*CSVReader, error) {
+	resChan := make(chan *Segment)
+	tx, err := db.Begin(false)
+	if err != nil {
+		return nil, err
+	}
+	bkt := tx.Bucket([]byte(label))
+	if bkt == nil {
+		return nil, errors.New("Missing label bucket")
+	}
+	segment_bkt := bkt.Bucket([]byte("segment"))
+	if segment_bkt == nil {
+		return nil, errors.New("Missing segment bucket")
+	}
+	schema_b := bkt.Get([]byte("schema"))
+	ns := NewNetBytes(schema_b)
+	schema := Schema(ns.DecodeString())
+
+	go segment_bkt.ForEach(func(key, segment_b []byte) error {
+		if len(schema) > 2 {
+			sgm := loadSegment(segment_b, schema)
+			resChan <- sgm
+			if sgm.err != nil {
+				close(resChan)
+				return sgm.err
 			}
-			return err
-		})
-		csv_writer.Flush()
-		return err
+		} else {
+			panic("Not implemented")
+			//err = loadSimpleSegment(segment, csv_writer)
+		}
+		return nil
 	})
-	return err
+
+	return &CSVReader{tx, label, resChan}, nil
+}
+
+func (self *CSVReader) Read() ([]byte, error) {
+	// Transaction closure
+	// Create a bucket.
+	sgm := <- self.resChan
+	return []byte("TODO"), nil
 }
