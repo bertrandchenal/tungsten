@@ -728,15 +728,25 @@ func (self *Resolver) Get(id uint32) string {
 	return res
 }
 
-type Reader struct {
+type Query struct {
 	tx *bbolt.Tx
 	label string
 	resChan chan *Segment
+	encoder *Encoder
 }
 
-type CSVReader Reader // XXX s/Reader/Pipe/ ??
+type Encoder {
+	Encode(s *Segment) ([]byte, err error)
+}
+type CSVEncoder struct {
+	csv_writer *csv.Writer
+}
 
-func NewCSVReader(db *bbolt.DB, label string) (*CSVReader, error) {
+func (self *CSVEncoder) Encode(s *Segment)  ([]byte, err error) {
+	return []byte("TODO"), nil
+}
+
+func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 	resChan := make(chan *Segment)
 	tx, err := db.Begin(false)
 	if err != nil {
@@ -769,12 +779,25 @@ func NewCSVReader(db *bbolt.DB, label string) (*CSVReader, error) {
 		return nil
 	})
 
-	return &CSVReader{tx, label, resChan}, nil
+	var encoder Encoder
+	if encoding == "csv" {
+		encoder = make(CSVEncoder)
+	} else {
+		err := fmt.Errorf("Unknown encoding : %v", encoding)
+		return nil, err
+	}
+	return &Query{tx, label, resChan, encoder}, nil
 }
 
-func (self *CSVReader) Read() ([]byte, error) {
-	// Transaction closure
-	// Create a bucket.
-	sgm := <- self.resChan
-	return []byte("TODO"), nil
+func (self *Query) WriteTo(w io.Writer) (int64, error) {
+	written := 0
+	for sgm := range self.resChan {
+		b, err := self.encoder.Encode(sgm)
+		if err != nil {
+			return written, err
+		}
+		written += len(b)
+		w.Write(b)
+	}
+	return written, nil
 }
