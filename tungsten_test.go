@@ -82,7 +82,9 @@ func RunEndtoEnd(t *testing.T, columns []string, source_file string) {
 	out_fh, err := os.OpenFile(out_file, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0640)
 	defer out_fh.Close()
 	check(t, err)
-	err = Read(db, label, out_fh)
+	qr, err := NewQuery(db, label, "csv")
+	check(t, err)
+	_, err = qr.WriteTo(out_fh)
 	check(t, err)
 
 	// Close db

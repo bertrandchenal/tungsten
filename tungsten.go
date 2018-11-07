@@ -55,7 +55,7 @@ type NetString struct {
 }
 
 func NewSegment(schema Schema) *Segment {
-	data := make([]*Record, CHUNK_SIZE / 2)
+	data := make([]*Record, 0) //, CHUNK_SIZE / 2
 	key_columns := schema[:len(schema)-1]
 	value_column := schema[len(schema)-1]
 	return &Segment{schema, key_columns, value_column, data, nil}
@@ -378,15 +378,9 @@ func dumpSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	int_values := make([]uint64, segment.Len())
 	float_values := make([]float64, segment.Len())
 	min_value := math.MaxFloat64
-	valuePos := segment.KeyWidth()
 	for pos, record := range segment.Records {
-		v := record.Data[valuePos]
-		float_v, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			panic(err)
-		}
-		float_values[pos] = float_v
-		min_value = math.Min(float_v, min_value)
+		float_values[pos] = record.Value
+		min_value = math.Min(record.Value, min_value)
 	}
 	// Convert float to int
 	for pos, float_v := range float_values {
@@ -410,9 +404,9 @@ func dumpSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	}
 	key_len := len(data_map) * 4
 	key := make([]byte, key_len)
-	// IDEA: serialize float values in a contigous array of float and
-	// simply reference it from the fst. This as the advantage of
-	// simplifying simple vs non-simple segment code
+	// IDEA: Save float_v has is and simply reference it from the
+	// fst. This as the advantage of simplifying simple vs non-simple
+	// segment code
 	for row := 0; row < segment.Len(); row++ {
 		for pos, colname := range segment.KeyColumns {
 			buff := key[pos*4 : (pos+1)*4]
@@ -633,7 +627,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 
 	// Load csv and fill chan with chunks
 	segment_chan := make(chan *Segment)
-	var fr *Segment
+	var sgm *Segment
 	go loadCsv(csv_stream, *schema, segment_chan)
 
 	// Transaction closure
@@ -649,12 +643,12 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 
 		// Save each chunk
 		var payload []byte
-		for fr = range segment_chan {
-			if fr.err != nil {
-				return fr.err
+		for sgm = range segment_chan {
+			if sgm.err != nil {
+				return sgm.err
 			}
 			if len(*schema) > 2 {
-				payload, err = dumpSegment(segment_bkt, fr)
+				payload, err = dumpSegment(segment_bkt, sgm)
 				if err != nil {
 					return err
 				}
@@ -679,7 +673,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if start_bkt == nil {
 				return errors.New("Missing 'starts' bucket")
 			} // TODO append ref to existing segment if key is already in bucket
-			err = start_bkt.Put(key, fr.StartKey())
+			err = start_bkt.Put(key, sgm.StartKey())
 			if err != nil {
 				return err
 			}
@@ -688,7 +682,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if end_bkt == nil {
 				return errors.New("Missing 'ends' bucket")
 			}
-			err = end_bkt.Put(key, fr.EndKey())
+			err = end_bkt.Put(key, sgm.EndKey())
 			if err != nil {
 				return err
 			}
@@ -732,17 +726,17 @@ type Query struct {
 	tx *bbolt.Tx
 	label string
 	resChan chan *Segment
-	encoder *Encoder
+	encoder Encoder
 }
 
-type Encoder {
-	Encode(s *Segment) ([]byte, err error)
+type Encoder interface {
+	Encode(*Segment) ([]byte, error)
 }
 type CSVEncoder struct {
 	csv_writer *csv.Writer
 }
 
-func (self *CSVEncoder) Encode(s *Segment)  ([]byte, err error) {
+func (self CSVEncoder) Encode(s *Segment)  ([]byte, error) {
 	return []byte("TODO"), nil
 }
 
@@ -764,24 +758,28 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 	ns := NewNetBytes(schema_b)
 	schema := Schema(ns.DecodeString())
 
-	go segment_bkt.ForEach(func(key, segment_b []byte) error {
-		if len(schema) > 2 {
-			sgm := loadSegment(segment_b, schema)
-			resChan <- sgm
-			if sgm.err != nil {
-				close(resChan)
+	go func() {
+		segment_bkt.ForEach(func(key, segment_b []byte) error {
+			if len(schema) > 2 {
+				sgm := loadSegment(segment_b, schema)
+				resChan <- sgm
+				if sgm.err != nil {
+					close(resChan)
 				return sgm.err
+				}
+			} else {
+				panic("Not implemented")
+				//err = loadSimpleSegment(segment, csv_writer)
 			}
-		} else {
-			panic("Not implemented")
-			//err = loadSimpleSegment(segment, csv_writer)
-		}
-		return nil
-	})
+			return nil
+		})
+		close(resChan)
+		tx.Rollback()
+	}()
 
 	var encoder Encoder
 	if encoding == "csv" {
-		encoder = make(CSVEncoder)
+		encoder = CSVEncoder{}
 	} else {
 		err := fmt.Errorf("Unknown encoding : %v", encoding)
 		return nil, err
@@ -790,13 +788,13 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 }
 
 func (self *Query) WriteTo(w io.Writer) (int64, error) {
-	written := 0
+	written := int64(0)
 	for sgm := range self.resChan {
 		b, err := self.encoder.Encode(sgm)
 		if err != nil {
 			return written, err
 		}
-		written += len(b)
+		written += int64(len(b))
 		w.Write(b)
 	}
 	return written, nil
