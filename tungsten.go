@@ -105,7 +105,7 @@ func (self *Segment) EndKey() []byte {
 func loadSegment(segment_b []byte, schema Schema) *Segment {
 	ns := NewNetBytes(segment_b)
 	items := ns.Decode()
-	indexes := items[:len(items)-4]
+	indexes := items[:len(items)-3]
 	conv_factor_b := items[len(items)-3]
 	min_value_b := items[len(items)-2]
 	data := items[len(items)-1]
@@ -730,13 +730,32 @@ type Query struct {
 }
 
 type Encoder interface {
+	Setup(Schema) ([]byte, error)
 	Encode(*Segment) ([]byte, error)
 }
+
 type CSVEncoder struct {
 	csv_writer *csv.Writer
 }
 
 func (self CSVEncoder) Encode(s *Segment)  ([]byte, error) {
+	buffer := &bytes.Buffer{}
+	csv_writer := csv.NewWriter(buffer)
+	key_width := s.KeyWidth()
+	row := make([]string, key_width + 1)
+	for _, rec := range s.Records {
+		copy(row, rec.Data)
+		row[key_width] = strconv.FormatFloat(rec.Value, 'f', -1, 64)
+		err := csv_writer.Write(row)
+		if err != nil {
+			panic(err)
+		}
+	}
+	csv_writer.Flush()
+	return buffer.Bytes(), nil
+}
+
+func (self CSVEncoder) Setup(s Schema)  ([]byte, error) {
 	return []byte("TODO"), nil
 }
 
@@ -784,6 +803,7 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 		err := fmt.Errorf("Unknown encoding : %v", encoding)
 		return nil, err
 	}
+	encoder.Setup(schema)
 	return &Query{tx, label, resChan, encoder}, nil
 }
 
