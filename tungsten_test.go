@@ -1,12 +1,12 @@
 package tungsten
 
 import (
+	"bytes"
 	"github.com/etcd-io/bbolt"
+	"io/ioutil"
 	"os"
 	"path"
 	"testing"
-	"io/ioutil"
-	"bytes"
 )
 
 const test_dir = "test-data"
@@ -24,7 +24,6 @@ func check(t *testing.T, err error) {
 		panic(err)
 	}
 }
-
 
 func TestNS(t *testing.T) {
 	var encoded = []string{
@@ -50,12 +49,11 @@ func TestNS(t *testing.T) {
 	}
 }
 
-
-func TestEndtoEnd(t *testing.T){
-	columns := []string{"x","y","z"}
+func TestEndtoEnd(t *testing.T) {
+	columns := []string{"x", "y", "z"}
 	source_file := "basic-two-cols.csv"
 	RunEndtoEnd(t, columns, source_file)
-	columns = []string{"x","z"}
+	columns = []string{"x", "z"}
 	source_file = "basic-one-col.csv"
 	RunEndtoEnd(t, columns, source_file)
 }
@@ -92,10 +90,10 @@ func RunEndtoEnd(t *testing.T, columns []string, source_file string) {
 	check(t, err)
 
 	// Compare files
-	in_content, err :=  ioutil.ReadFile(in_file)
+	in_content, err := ioutil.ReadFile(in_file)
 	check(t, err)
 
-	out_content, err :=  ioutil.ReadFile(out_file)
+	out_content, err := ioutil.ReadFile(out_file)
 	check(t, err)
 
 	if !bytes.Equal(in_content, out_content) {

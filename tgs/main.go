@@ -75,12 +75,14 @@ func main() {
 			unravel(err)
 		}
 		defer fh.Close()
-		err := tungsten.Read(db, *read_label, fh)
-		unravel(err)		
+		qr, err := tungsten.NewQuery(db, *read_label, "csv")
+		unravel(err)
+		_, err = qr.WriteTo(fh)
+		unravel(err)
 	} else if *info != "" {
 		schema, err := tungsten.GetSchema(db, *info)
 		unravel(err)
-		fmt.Println("Schema:", strings.Join(*schema, ", "))
+		fmt.Println("Schema:", strings.Join(schema, ", "))
 	}
 
 	elapsed := time.Since(start)

@@ -1,4 +1,3 @@
-
 package tungsten
 
 import (
@@ -21,32 +20,30 @@ import (
 const CHUNK_SIZE = 1e6 // Must be < 2^32
 const CONV_FACTOR = 10000
 
-
-type Schema []string
 type Segment struct {
 	Schema      []string
 	KeyColumns  []string
 	ValueColumn string
-	Records []*Record
+	Records     []*Record
 	err         error
 }
 
 type Record struct {
-	Data      []string
+	Data  []string
 	Value float64
-	err error
+	err   error
 }
 
 func NewRecord(length int) *Record {
-	data:= make([]string, length)
+	data := make([]string, length)
 	return &Record{data, 0, nil}
 }
 
 type Index struct {
-	Buff  bytes.Buffer
+	Buff    bytes.Buffer
 	Reverse []uint32
-	Name   string
-	err    error
+	Name    string
+	err     error
 }
 
 type NetString struct {
@@ -54,7 +51,7 @@ type NetString struct {
 	err    error
 }
 
-func NewSegment(schema Schema) *Segment {
+func NewSegment(schema []string) *Segment {
 	data := make([]*Record, 0) //, CHUNK_SIZE / 2
 	key_columns := schema[:len(schema)-1]
 	value_column := schema[len(schema)-1]
@@ -83,7 +80,6 @@ func (self *Segment) ColPos(colName string) int {
 	return -1
 }
 
-
 func (self *Segment) Width() int {
 	return len(self.Schema)
 }
@@ -91,7 +87,6 @@ func (self *Segment) Width() int {
 func (self *Segment) KeyWidth() int {
 	return len(self.KeyColumns)
 }
-
 
 func (self *Segment) StartKey() []byte {
 	return self.Key(0)
@@ -101,8 +96,7 @@ func (self *Segment) EndKey() []byte {
 	return self.Key(self.Len() - 1)
 }
 
-
-func loadSegment(segment_b []byte, schema Schema) *Segment {
+func loadSegment(segment_b []byte, schema []string) *Segment {
 	ns := NewNetBytes(segment_b)
 	items := ns.Decode()
 	indexes := items[:len(items)-3]
@@ -112,11 +106,11 @@ func loadSegment(segment_b []byte, schema Schema) *Segment {
 	// Extract conv_factor & min_value of value column
 	conv_factor, err := strconv.ParseFloat(string(conv_factor_b), 64)
 	if err != nil {
-		return &Segment{err:err}
+		return &Segment{err: err}
 	}
 	min_value, err := strconv.ParseFloat(string(min_value_b), 64)
 	if err != nil {
-		return &Segment{err:err}
+		return &Segment{err: err}
 	}
 	var resolvers []*Resolver
 	for _, idx := range indexes {
@@ -124,7 +118,7 @@ func loadSegment(segment_b []byte, schema Schema) *Segment {
 	}
 	fst, err := vellum.Load(data)
 	if err != nil {
-		return &Segment{err:err}
+		return &Segment{err: err}
 	}
 	fst_it, err := fst.Iterator(nil, nil)
 
@@ -134,7 +128,7 @@ func loadSegment(segment_b []byte, schema Schema) *Segment {
 		key, val := fst_it.Current()
 		record := NewRecord(resolver_len + 1)
 		for pos, resolver := range resolvers {
-			buff := key[pos * 4:(pos + 1) * 4]
+			buff := key[pos*4 : (pos+1)*4]
 			id := binary.BigEndian.Uint32(buff)
 			record.Data[pos] = resolver.Get(id)
 		}
@@ -150,7 +144,6 @@ func loadSegment(segment_b []byte, schema Schema) *Segment {
 	fst.Close()
 	return sgm
 }
-
 
 // func loadSimpleSegment(segment []byte, csv_writer *csv.Writer) error {
 // 	// TODO implement a goroutine to parallelize decode-load and iteration
@@ -279,7 +272,7 @@ func (self *NetString) DecodeString() []string {
 	return res
 }
 
-func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
+func loadCsv(fh io.Reader, schema []string, segment_chan chan *Segment) {
 	// Read a csv and feed the segment_chan with segments of size
 	// CHUNK_SIZE or less
 	r := csv.NewReader(fh)
@@ -331,11 +324,11 @@ func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
 
 			// Create and fill record
 			record := NewRecord(len(schema))
-			for schPos, _ := range(segment.KeyColumns) {
+			for schPos, _ := range segment.KeyColumns {
 				csvPos := colIdx[schPos]
 				record.Data[schPos] = csv_record[csvPos]
 			}
-			valPos := colIdx[len(schema) - 1]
+			valPos := colIdx[len(schema)-1]
 			val := csv_record[valPos]
 			record.Value, err = strconv.ParseFloat(val, 64)
 			if err != nil {
@@ -348,7 +341,7 @@ func loadCsv(fh io.Reader, schema Schema, segment_chan chan *Segment) {
 	}
 }
 
-func dumpSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
+func dumpSegment(segment *Segment) ([]byte, error) {
 	// Compute index for every column of the segment, save those and
 	// save the fst
 	inbox := make(chan *Index, segment.Len())
@@ -362,7 +355,7 @@ func dumpSegment(bkt *bbolt.Bucket, segment *Segment) ([]byte, error) {
 	// Save indexes
 	data_map := make(map[string][]uint32)
 	for i := 0; i < segment.KeyWidth(); i++ {
-		idx := <- inbox
+		idx := <-inbox
 		if idx.err != nil {
 			return nil, idx.err
 		}
@@ -602,8 +595,8 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 	return err
 }
 
-func GetSchema(db *bbolt.DB, label string) (*Schema, error) {
-	var schema *Schema
+func GetSchema(db *bbolt.DB, label string) ([]string, error) {
+	var schema []string
 	err := db.View(func(tx *bbolt.Tx) error {
 		bkt := tx.Bucket([]byte(label))
 		if bkt == nil {
@@ -611,9 +604,7 @@ func GetSchema(db *bbolt.DB, label string) (*Schema, error) {
 		}
 		value := bkt.Get([]byte("schema"))
 		ns := NewNetString(string(value))
-		columns := ns.DecodeString()
-		schema_ := Schema(columns)
-		schema = &schema_
+		schema = ns.DecodeString()
 		return nil
 	})
 	return schema, err
@@ -628,7 +619,7 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 	// Load csv and fill chan with chunks
 	segment_chan := make(chan *Segment)
 	var sgm *Segment
-	go loadCsv(csv_stream, *schema, segment_chan)
+	go loadCsv(csv_stream, schema, segment_chan)
 
 	// Transaction closure
 	err = db.Update(func(tx *bbolt.Tx) error {
@@ -647,17 +638,19 @@ func Write(db *bbolt.DB, label string, csv_stream io.Reader) error {
 			if sgm.err != nil {
 				return sgm.err
 			}
-			if len(*schema) > 2 {
-				payload, err = dumpSegment(segment_bkt, sgm)
+			if len(schema) > 2 {
+				payload, err = dumpSegment(sgm)
+
 				if err != nil {
 					return err
 				}
 			} else {
 				panic("Not Implemented")
-				// payload, err = dumpSimpleSegment(segment_bkt, fr)
+				// payload, err = dumpSimpleSegment(sgm)
 				// if err != nil {
 				// 	return err
 				// }
+
 			}
 			seq, err := segment_bkt.NextSequence()
 			if err != nil {
@@ -723,26 +716,26 @@ func (self *Resolver) Get(id uint32) string {
 }
 
 type Query struct {
-	tx *bbolt.Tx
-	label string
+	tx      *bbolt.Tx
+	label   string
 	resChan chan *Segment
 	encoder Encoder
 }
 
 type Encoder interface {
-	Setup(Schema) ([]byte, error)
+	Setup() ([]byte, error)
 	Encode(*Segment) ([]byte, error)
 }
 
 type CSVEncoder struct {
-	csv_writer *csv.Writer
+	schema []string
 }
 
-func (self CSVEncoder) Encode(s *Segment)  ([]byte, error) {
+func (self CSVEncoder) Encode(s *Segment) ([]byte, error) {
 	buffer := &bytes.Buffer{}
 	csv_writer := csv.NewWriter(buffer)
 	key_width := s.KeyWidth()
-	row := make([]string, key_width + 1)
+	row := make([]string, key_width+1)
 	for _, rec := range s.Records {
 		copy(row, rec.Data)
 		row[key_width] = strconv.FormatFloat(rec.Value, 'f', -1, 64)
@@ -755,8 +748,16 @@ func (self CSVEncoder) Encode(s *Segment)  ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
-func (self CSVEncoder) Setup(s Schema)  ([]byte, error) {
-	return []byte("TODO"), nil
+func (self CSVEncoder) Setup() ([]byte, error) {
+	buffer := &bytes.Buffer{}
+	csv_writer := csv.NewWriter(buffer)
+	row := []string(self.schema)
+	err := csv_writer.Write(row)
+	if err != nil {
+		return nil, err
+	}
+	csv_writer.Flush()
+	return buffer.Bytes(), nil
 }
 
 func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
@@ -775,7 +776,7 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 	}
 	schema_b := bkt.Get([]byte("schema"))
 	ns := NewNetBytes(schema_b)
-	schema := Schema(ns.DecodeString())
+	schema := ns.DecodeString()
 
 	go func() {
 		segment_bkt.ForEach(func(key, segment_b []byte) error {
@@ -784,7 +785,7 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 				resChan <- sgm
 				if sgm.err != nil {
 					close(resChan)
-				return sgm.err
+					return sgm.err
 				}
 			} else {
 				panic("Not implemented")
@@ -798,17 +799,22 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 
 	var encoder Encoder
 	if encoding == "csv" {
-		encoder = CSVEncoder{}
+		encoder = CSVEncoder{schema}
 	} else {
 		err := fmt.Errorf("Unknown encoding : %v", encoding)
 		return nil, err
 	}
-	encoder.Setup(schema)
 	return &Query{tx, label, resChan, encoder}, nil
 }
 
 func (self *Query) WriteTo(w io.Writer) (int64, error) {
-	written := int64(0)
+	header, err := self.encoder.Setup()
+	if err != nil {
+		return 0, err
+	}
+	w.Write(header)
+
+	written := int64(len(header))
 	for sgm := range self.resChan {
 		b, err := self.encoder.Encode(sgm)
 		if err != nil {
