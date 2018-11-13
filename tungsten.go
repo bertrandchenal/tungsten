@@ -397,9 +397,6 @@ func dumpSegment(segment *Segment) ([]byte, error) {
 	}
 	key_len := len(data_map) * 4
 	key := make([]byte, key_len)
-	// IDEA: Save float_v has is and simply reference it from the
-	// fst. This as the advantage of simplifying simple vs non-simple
-	// segment code
 	for row := 0; row < segment.Len(); row++ {
 		for pos, colname := range segment.KeyColumns {
 			buff := key[pos*4 : (pos+1)*4]
