@@ -1,11 +1,20 @@
 package tungsten
 
+
+// IDEA: use pure fst (without the indexing stuff) append each segment
+// to a given log file, if there is a multi-col segment, the first col
+// can be an fst whose values point to offset of each sub-segment
+
+// TODO bench fst with timestamp as iso string vs ts as hex-encoded string vs bytes
+
+
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"bitbucket.org/bertrandchenal/netstring"
 	"github.com/couchbase/vellum"
 	"github.com/etcd-io/bbolt"
 	"io"
@@ -46,10 +55,6 @@ type Index struct {
 	err     error
 }
 
-type NetString struct {
-	buffer bytes.Buffer
-	err    error
-}
 
 func NewSegment(schema []string) *Segment {
 	data := make([]*Record, 0) //, CHUNK_SIZE / 2
@@ -62,14 +67,20 @@ func (self *Segment) Append(record *Record) {
 	self.Records = append(self.Records, record)
 }
 
+
 func (self *Segment) Len() int {
 	return len(self.Records)
 }
 
+
 func (self *Segment) Key(row int) []byte {
-	ns := NewNetString(self.Records[row].Data...)
-	return ns.buffer.Bytes()
+	bytes, err := netstring.EncodeString(self.Records[row].Data...)
+	if err != nil {
+		panic(err)
+	}
+	return bytes
 }
+
 
 func (self *Segment) ColPos(colName string) int {
 	for pos, col := range self.KeyColumns {
@@ -80,25 +91,33 @@ func (self *Segment) ColPos(colName string) int {
 	return -1
 }
 
+
 func (self *Segment) Width() int {
 	return len(self.Schema)
 }
+
 
 func (self *Segment) KeyWidth() int {
 	return len(self.KeyColumns)
 }
 
+
 func (self *Segment) StartKey() []byte {
 	return self.Key(0)
 }
+
 
 func (self *Segment) EndKey() []byte {
 	return self.Key(self.Len() - 1)
 }
 
+
 func loadSegment(segment_b []byte, schema []string) *Segment {
-	ns := NewNetBytes(segment_b)
-	items := ns.Decode()
+	items, err := netstring.Decode(segment_b)
+	if err != nil {
+		panic(err)
+	}
+
 	indexes := items[:len(items)-3]
 	conv_factor_b := items[len(items)-3]
 	min_value_b := items[len(items)-2]
@@ -148,7 +167,7 @@ func loadSegment(segment_b []byte, schema []string) *Segment {
 }
 
 func loadSimpleSegment(segment []byte, schema []string) *Segment {
-	ns := NewNetBytes(segment)
+	ns := netstring.NewNetBytes(segment)
 	items := ns.Decode()
 	conv_factor_b := items[len(items)-3]
 	min_value_b := items[len(items)-2]
@@ -187,91 +206,6 @@ func loadSimpleSegment(segment []byte, schema []string) *Segment {
 	return sgm
 }
 
-// Netstring constructors
-func NewNetBytes(values ...[]byte) *NetString {
-	var buffer bytes.Buffer
-	for _, val := range values {
-		buffer.Write(val)
-	}
-	return &NetString{buffer, nil}
-}
-
-func NewNetString(values ...string) *NetString {
-	var buffer bytes.Buffer
-	for _, val := range values {
-		buffer.WriteString(val)
-	}
-	return &NetString{buffer, nil}
-}
-
-// NetString encoding
-func (self *NetString) Encode(items ...[]byte) {
-	tail := ","
-	for _, item := range items {
-		head := fmt.Sprintf("%d:", len(item))
-		_, err := self.buffer.WriteString(head)
-		_, err = self.buffer.Write(item)
-		_, err = self.buffer.WriteString(tail)
-		if err != nil && self.err != nil {
-			self.err = err
-			return
-		}
-	}
-}
-
-func (self *NetString) EncodeString(items ...string) {
-	for _, item := range items {
-		self.Encode([]byte(item))
-	}
-}
-
-// Netstring decoding
-func (self *NetString) Decode() [][]byte {
-	head, err := self.buffer.ReadBytes(byte(':'))
-	if err == io.EOF {
-		return make([][]byte, 0)
-	}
-	// Read header giving item size
-	length, err := strconv.ParseInt(string(head[:len(head)-1]), 10, 32)
-	if err != nil {
-		self.err = err
-		return nil
-	}
-	// Read payload
-	payload := make([]byte, length)
-	_, err = self.buffer.Read(payload)
-	if err != nil {
-		self.err = err
-		return nil
-	}
-	res := [][]byte{payload}
-	// Read end delimiter
-	delim, err := self.buffer.ReadByte()
-	if err != nil {
-		self.err = err
-		return nil
-	}
-	if delim != byte(',') {
-		self.err = errors.New("Unable de decode netstring, unexpected end of stream")
-		return nil
-	}
-	// Recurse
-	tail := self.Decode()
-	if self.err != nil {
-		return nil
-	}
-
-	return append(res, tail...)
-}
-
-func (self *NetString) DecodeString() []string {
-	res_bytes := self.Decode()
-	res := make([]string, len(res_bytes))
-	for pos, val := range res_bytes {
-		res[pos] = string(val)
-	}
-	return res
-}
 
 func loadCsv(fh io.Reader, schema []string, segment_chan chan *Segment) {
 	// Read a csv and feed the segment_chan with segments of size
@@ -353,7 +287,7 @@ func dumpSegment(segment *Segment) ([]byte, error) {
 			inbox <- idx
 		}
 	}()
-	ns := NewNetString()
+	ns := netstring.NewNetString()
 	// Save indexes
 	data_map := make(map[string][]uint32)
 	for i := 0; i < segment.KeyWidth(); i++ {
@@ -363,8 +297,8 @@ func dumpSegment(segment *Segment) ([]byte, error) {
 		}
 		// Save the index in netstring
 		ns.Encode(idx.Buff.Bytes())
-		if ns.err != nil {
-			return nil, ns.err
+		if ns.Err != nil {
+			return nil, ns.Err
 		}
 		// Keep values (aka references to index)
 		data_map[idx.Name] = idx.Reverse
@@ -384,12 +318,12 @@ func dumpSegment(segment *Segment) ([]byte, error) {
 	}
 	// Save factor & min_value
 	ns.EncodeString(strconv.FormatFloat(CONV_FACTOR, 'E', -1, 64))
-	if ns.err != nil {
-		return nil, ns.err
+	if ns.Err != nil {
+		return nil, ns.Err
 	}
 	ns.EncodeString(strconv.FormatFloat(min_value, 'E', -1, 64))
-	if ns.err != nil {
-		return nil, ns.err
+	if ns.Err != nil {
+		return nil, ns.Err
 	}
 	// Use columns id to encode main fst
 	var fst bytes.Buffer
@@ -415,15 +349,15 @@ func dumpSegment(segment *Segment) ([]byte, error) {
 	builder.Close()
 	// Add main fst to netstring & save in db
 	ns.Encode(fst.Bytes())
-	payload := ns.buffer.Bytes()
-	if ns.err != nil {
-		return nil, ns.err
+	payload := ns.Buffer.Bytes()
+	if ns.Err != nil {
+		return nil, ns.Err
 	}
 	return payload, nil
 }
 
 func dumpSimpleSegment(segment *Segment) ([]byte, error) {
-	ns := NewNetString()
+	ns := netstring.NewNetString()
 	// Convert value column to float & compute min
 	int_values := make([]uint64, segment.Len())
 	float_values := make([]float64, segment.Len())
@@ -439,12 +373,12 @@ func dumpSimpleSegment(segment *Segment) ([]byte, error) {
 	}
 	// Save factor & min_value
 	ns.EncodeString(strconv.FormatFloat(CONV_FACTOR, 'E', -1, 64))
-	if ns.err != nil {
-		return nil, ns.err
+	if ns.Err != nil {
+		return nil, ns.Err
 	}
 	ns.EncodeString(strconv.FormatFloat(min_value, 'E', -1, 64))
-	if ns.err != nil {
-		return nil, ns.err
+	if ns.Err != nil {
+		return nil, ns.Err
 	}
 	// Encode main fst
 	var fst bytes.Buffer
@@ -461,9 +395,9 @@ func dumpSimpleSegment(segment *Segment) ([]byte, error) {
 	builder.Close()
 	// Add main fst to netstring & save in db
 	ns.Encode(fst.Bytes())
-	payload := ns.buffer.Bytes()
-	if ns.err != nil {
-		return nil, ns.err
+	payload := ns.Buffer.Bytes()
+	if ns.Err != nil {
+		return nil, ns.Err
 	}
 	return payload, nil
 }
@@ -567,11 +501,11 @@ func CreateLabel(db *bbolt.DB, name string, columns []string) error {
 		if err != nil {
 			return err
 		}
-		ns := NewNetString()
+		ns := netstring.NewNetString()
 		ns.EncodeString(columns...)
-		schema := ns.buffer.Bytes()
-		if ns.err != nil {
-			return ns.err
+		schema := ns.Buffer.Bytes()
+		if ns.Err != nil {
+			return ns.Err
 		}
 		if err = bkt.Put([]byte("schema"), schema); err != nil {
 			// Save schema
@@ -597,7 +531,7 @@ func GetSchema(db *bbolt.DB, label string) ([]string, error) {
 			return errors.New("Missing label bucket")
 		}
 		value := bkt.Get([]byte("schema"))
-		ns := NewNetString(string(value))
+		ns := netstring.NewNetString(string(value))
 		schema = ns.DecodeString()
 		return nil
 	})
@@ -766,7 +700,7 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 		return nil, errors.New("Missing segment bucket")
 	}
 	schema_b := bkt.Get([]byte("schema"))
-	ns := NewNetBytes(schema_b)
+	ns := netstring.NewNetBytes(schema_b)
 	schema := ns.DecodeString()
 
 	go func() {
@@ -801,6 +735,7 @@ func NewQuery(db *bbolt.DB, label string, encoding string) (*Query, error) {
 	}
 	return &Query{tx, label, resChan, encoder}, nil
 }
+
 
 func (self *Query) WriteTo(w io.Writer) (int64, error) {
 	header, err := self.encoder.Setup()
