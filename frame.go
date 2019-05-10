@@ -2,11 +2,12 @@ package tungsten
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
-	"github.com/DataDog/zstd"
 	"github.com/couchbase/vellum"
 	"io"
+	"sort"
 	"strconv"
 )
 
@@ -36,12 +37,11 @@ func (self *Tic) CommonPrefix(otherTic *Tic) int {
 	if otherTic == nil {
 		return 0
 	}
-
 	depth := len(self.Key)
 	res := depth
 	for pos := 0; pos < depth; pos++ {
 		if self.Key[pos] != otherTic.Key[pos] {
-			return pos + 1
+			return pos
 		}
 	}
 	return res
@@ -49,25 +49,30 @@ func (self *Tic) CommonPrefix(otherTic *Tic) int {
 
 func NewFrame(schema []string) *Frame {
 	depth := len(schema) - 1
-	buffers := make([]*bytes.Buffer, len(schema))
-	for pos := 0; pos < len(schema); pos++ {
+	buffers := make([]*bytes.Buffer, depth)
+	for pos := 0; pos < depth; pos++ {
 		buffers[pos] = &bytes.Buffer{}
 	}
 	frame := &Frame{Schema: schema, Depth: depth}
 	frame.buffers = buffers
-	frame.transducers = make([]*vellum.Builder, len(schema))
+	frame.transducers = make([]*vellum.Builder, depth)
+
+	// Instanciate top-level fst
+	fst, err := vellum.New(frame.buffers[0], nil)
+	panicker(err)
+	frame.transducers[0] = fst
+
 	return frame
 }
 
 func (self *Frame) RollOver(fromPos int) {
 	// Re-instantiate a new transducer from fromPos to end of array of
 	// transducers
-	// initialize transducers
-	for pos := fromPos; pos < len(self.Schema); pos++ {
-		println("ROLLOVER", pos)
+	for pos := fromPos + 1 ; pos < self.Depth; pos++ {
 		if self.transducers[pos] != nil {
 			self.transducers[pos].Close()
 		}
+		println("ROLLOVER", self.Schema[pos], len(self.buffers[pos].Bytes()))
 		buff := self.buffers[pos]
 		fst, err := vellum.New(buff, nil)
 		panicker(err)
@@ -130,33 +135,47 @@ func NewFrameFromCsv(schema []string, csv_in io.Reader) *Frame {
 func (self *Frame) Append(tic *Tic) {
 	prefix := tic.CommonPrefix(self.lastTic)
 	self.lastTic = tic
-	if prefix < self.Depth {
-		self.RollOver(prefix)
-	}
+	self.RollOver(prefix)
 
 	for i := prefix; i < self.Depth-1; i++ {
 		offset := self.buffers[i+1].Len()
+		println("INSERT", self.Schema[i], tic.Key[i], offset)
 		self.transducers[i].Insert([]byte(tic.Key[i]), uint64(offset))
 	}
-	self.transducers[self.Depth].Insert([]byte(tic.Key[self.Depth-1]), tic.Value)
+	self.transducers[self.Depth-1].Insert([]byte(tic.Key[self.Depth-1]), tic.Value)
 }
 
 func (self *Frame) Save(fh io.Writer) {
-	buff := &bytes.Buffer{}
-	offsets := make([]int, len(self.Schema))
-	// TODO use pre-computed dict feature from zstd
-	z_fh := zstd.NewWriterLevel(fh, 10)
+	offsets := make(map[string]int)
 
 	// Write fst from leaf to root
-	for pos := self.Depth; pos > 0; pos-- {
+	offset := 0
+	for pos := self.Depth-1; pos >= 0; pos-- {
+		self.transducers[pos].Close()
 		b := self.buffers[pos].Bytes()
-		println("WRITE OUT", pos, len(b))
-		offsets[pos] = len(b)
-		_, err := z_fh.Write(b)
+		offset += len(b)
+		key := self.Schema[pos]
+		println("WRITE OUT", key, pos, offset)
+		offsets[key] = offset
+		_, err := fh.Write(b)
 		panicker(err)
 	}
-	// Write index TODO
-	z_fh.Write(buff.Bytes())
-	// Write index lenght TODO
-	z_fh.Close()
+	// Write offsets
+	buff := &bytes.Buffer{}
+	sort.Strings(self.Schema)
+	transducer, err := vellum.New(buff, nil)
+	panicker(err)
+	for _, name := range self.Schema {
+		transducer.Insert([]byte(name), uint64(offsets[name]))
+	}
+	transducer.Close()
+	b := buff.Bytes()
+	println("WRITE Offsets", len(b))
+	_, err = fh.Write(b)
+	panicker(err)
+
+	// Write offset fst lenght
+	len_buff := make([]byte, 2)
+	binary.BigEndian.PutUint16(len_buff, uint16(len(b)))
+	fh.Write(len_buff)
 }
